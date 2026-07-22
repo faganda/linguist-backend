@@ -7,11 +7,13 @@ import { Resend } from 'resend';
 import crypto from 'node:crypto';
 import {
     LANGUAGES, PRIMARY_MODEL, PRIMARY_THINKING, FALLBACK_MODEL, FALLBACK_THINKING,
-    DICTIONARY_SCHEMA_VERSION, createTranslationService
+    DICTIONARY_SCHEMA_VERSION, createTranslationService, buildGeminiCompatibilityRequests,
+    geminiCompatibilityKey, isGeminiInvalidArgument
 } from './translation-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
+const BACKEND_VERSION = '3.2.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -162,6 +164,7 @@ function measuredGeminiUsage(data, startedAt, model, thinkingLevel) {
 }
 
 const translationService = createTranslationService({ db, FieldValue, recordUsage });
+const genericCompatibilityModes = new Map();
 
 async function callGemini(body, { model = PRIMARY_MODEL, thinkingLevel = PRIMARY_THINKING, timeoutMs = 25_000 } = {}) {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -169,16 +172,36 @@ async function callGemini(body, { model = PRIMARY_MODEL, thinkingLevel = PRIMARY
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const safeBody = JSON.parse(JSON.stringify(body || {}));
-        safeBody.generationConfig = {
-            ...(safeBody.generationConfig || {}),
-            thinkingConfig:{ thinkingLevel }
-        };
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+        const send = requestBody => fetch(endpoint, {
             method:'POST', signal:controller.signal,
-            headers:{ 'Content-Type':'application/json', 'x-goog-api-key':apiKey }, body:JSON.stringify(safeBody)
+            headers:{ 'Content-Type':'application/json', 'x-goog-api-key':apiKey }, body:JSON.stringify(requestBody)
         });
-        const data = await response.json();
+        const compatibilityKey = geminiCompatibilityKey(model, body);
+        const preferredMode = genericCompatibilityModes.get(compatibilityKey);
+        const variants = buildGeminiCompatibilityRequests(body, thinkingLevel);
+        if (preferredMode) variants.sort((left, right) => Number(right.mode === preferredMode) - Number(left.mode === preferredMode));
+        let response; let data; let selectedMode = variants[0]?.mode || 'structured';
+        const rejectedModes = [];
+        for (const variant of variants) {
+            selectedMode = variant.mode;
+            response = await send(variant.body);
+            data = await response.json().catch(() => ({}));
+            if (response.ok) {
+                genericCompatibilityModes.set(compatibilityKey, selectedMode);
+                break;
+            }
+            if (!isGeminiInvalidArgument(response, data)) break;
+            rejectedModes.push(selectedMode);
+        }
+        if (!response.ok && isGeminiInvalidArgument(response, data)) {
+            console.warn('Generic Gemini route rejected every compatible request form.', {
+                model, rejectedModes, providerStatus:data?.error?.status || 'INVALID_ARGUMENT',
+                providerMessage:String(data?.error?.message || '').slice(0, 300)
+            });
+            const error = new Error('The translation model rejected its request configuration. Verify that Render uses the Tier 1 Gemini API key and the model variables shown in DEPLOYMENT.md.');
+            error.status = 502; error.code = 'MODEL_REQUEST_INVALID'; throw error;
+        }
         if (!response.ok) { const error = new Error(data?.error?.message || 'Gemini request failed.'); error.status = response.status; throw error; }
         return data;
     } catch (error) {
@@ -257,7 +280,8 @@ async function resolveUserEmails(uids) {
 }
 
 app.get('/health', (_req, res) => res.json({
-    ok:true, service:'linguist-backend', schemaVersion:DICTIONARY_SCHEMA_VERSION,
+    ok:true, service:'linguist-backend', version:BACKEND_VERSION, schemaVersion:DICTIONARY_SCHEMA_VERSION,
+    requestCompatibility:'adaptive-json-v2',
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     feedbackEmailConfigured:!!(resend && FEEDBACK_EMAIL_FROM && FEEDBACK_EMAIL_TO)
 }));

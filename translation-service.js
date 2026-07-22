@@ -580,10 +580,23 @@ export function extractGeminiText(data) {
 }
 
 export function parseGeminiJSON(data) {
-    const text = extractGeminiText(data);
+    const text = extractGeminiText(data).replace(/^\uFEFF/, '').trim();
     if (!text) throw Object.assign(new Error('The model returned an empty response.'), { code:'MODEL_EMPTY' });
     try { return JSON.parse(text); }
-    catch (_) { throw Object.assign(new Error('The model returned invalid JSON.'), { code:'MODEL_JSON_INVALID' }); }
+    catch (_) {
+        // JSON mode is normally exact, but the last compatibility tier deliberately
+        // permits plain text so a provider-side configuration change cannot make
+        // every translation fail. Accept a single fenced or surrounded JSON value;
+        // deterministic quality gates still validate the parsed object afterwards.
+        const unfenced = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        try { return JSON.parse(unfenced); } catch (_) {}
+        const objectStart = unfenced.indexOf('{');
+        const objectEnd = unfenced.lastIndexOf('}');
+        if (objectStart >= 0 && objectEnd > objectStart) {
+            try { return JSON.parse(unfenced.slice(objectStart, objectEnd + 1)); } catch (_) {}
+        }
+        throw Object.assign(new Error('The model returned invalid JSON.'), { code:'MODEL_JSON_INVALID' });
+    }
 }
 
 function timestampMillis(value) {
@@ -616,6 +629,115 @@ function usageMetrics(data) {
     };
 }
 
+export function responseSchema(body) {
+    const generationConfig = body?.generationConfig || {};
+    return generationConfig.responseJsonSchema || generationConfig.responseSchema || null;
+}
+
+function schemaComplexity(schema) {
+    const result = { properties:0, nodes:0, depth:0 };
+    const visit = (value, depth) => {
+        if (!value || typeof value !== 'object') return;
+        result.nodes += 1;
+        result.depth = Math.max(result.depth, depth);
+        if (value.properties && typeof value.properties === 'object') {
+            result.properties += Object.keys(value.properties).length;
+        }
+        Object.values(value).forEach(child => visit(child, depth + 1));
+    };
+    visit(schema, 0);
+    return result;
+}
+
+export function isComplexResponseSchema(schema) {
+    if (!schema) return false;
+    const complexity = schemaComplexity(schema);
+    // Gemini explicitly documents that very large/deep schemas may be rejected.
+    // Qelumi's core dictionary contract currently has 69 properties; proactively
+    // use JSON mode plus server validation instead of paying for a known 400.
+    return complexity.properties > 60 || complexity.nodes > 140 || complexity.depth > 8
+        || JSON.stringify(schema).length > 12_000;
+}
+
+export function isGeminiInvalidArgument(response, data) {
+    if (response?.status !== 400) return false;
+    const providerStatus = String(data?.error?.status || '').toUpperCase();
+    const message = String(data?.error?.message || '').toLowerCase();
+    return providerStatus === 'INVALID_ARGUMENT' || !message || message.includes('invalid argument')
+        || message.includes('responsejsonschema') || message.includes('responseschema');
+}
+
+function combinedSystemText(systemInstruction) {
+    return (Array.isArray(systemInstruction?.parts) ? systemInstruction.parts : [])
+        .filter(part => typeof part?.text === 'string')
+        .map(part => part.text.trim()).filter(Boolean).join('\n\n');
+}
+
+export function requestWithoutConstrainedSchema(body) {
+    const retryBody = clone(body);
+    const schema = responseSchema(retryBody);
+    retryBody.generationConfig = { ...(retryBody.generationConfig || {}) };
+    delete retryBody.generationConfig.responseJsonSchema;
+    delete retryBody.generationConfig.responseSchema;
+    retryBody.generationConfig.responseMimeType = 'application/json';
+    const existingSystem = combinedSystemText(retryBody.systemInstruction);
+    const schemaContract = schema
+        ? `Return exactly one valid JSON object matching this JSON Schema contract. Do not add Markdown or commentary.\nJSON Schema:\n${JSON.stringify(schema)}`
+        : 'Return exactly one valid JSON object. Do not add Markdown or commentary.';
+    // Gemini system instructions are text-only. Combining the contract into one
+    // text part is accepted more consistently than appending a second system part.
+    retryBody.systemInstruction = {
+        ...(retryBody.systemInstruction || {}),
+        parts:[{ text:[existingSystem, schemaContract].filter(Boolean).join('\n\n') }]
+    };
+    return retryBody;
+}
+
+function requestWithoutThinking(body) {
+    const retryBody = clone(body);
+    retryBody.generationConfig = { ...(retryBody.generationConfig || {}) };
+    delete retryBody.generationConfig.thinkingConfig;
+    return retryBody;
+}
+
+function requestWithoutJsonGenerationFields(body) {
+    const retryBody = requestWithoutThinking(body);
+    retryBody.generationConfig = { ...(retryBody.generationConfig || {}) };
+    delete retryBody.generationConfig.responseJsonSchema;
+    delete retryBody.generationConfig.responseSchema;
+    delete retryBody.generationConfig.responseMimeType;
+    return retryBody;
+}
+
+export function buildGeminiCompatibilityRequests(body, thinkingLevel) {
+    const structured = clone(body || {});
+    structured.generationConfig = {
+        ...(structured.generationConfig || {}),
+        ...(thinkingLevel ? { thinkingConfig:{ thinkingLevel } } : {})
+    };
+    const schema = responseSchema(structured);
+    const jsonPrompt = schema ? requestWithoutConstrainedSchema(structured) : structured;
+    const candidates = [];
+    if (!schema || !isComplexResponseSchema(schema)) candidates.push({ mode:'structured', body:structured });
+    if (schema) candidates.push({ mode:'json_schema_prompt', body:jsonPrompt });
+    if (thinkingLevel) candidates.push({ mode:'json_without_thinking', body:requestWithoutThinking(jsonPrompt) });
+    candidates.push({ mode:'plain_json_fallback', body:requestWithoutJsonGenerationFields(jsonPrompt) });
+
+    const seen = new Set();
+    return candidates.filter(candidate => {
+        const signature = JSON.stringify(candidate.body);
+        if (seen.has(signature)) return false;
+        seen.add(signature);
+        return true;
+    });
+}
+
+export function geminiCompatibilityKey(model, body) {
+    const schema = responseSchema(body);
+    const schemaKey = schema ? crypto.createHash('sha256').update(JSON.stringify(schema)).digest('hex') : 'none';
+    return `${model}|${schemaKey}`;
+}
+
 export function createTranslationService({ db, FieldValue, recordUsage = async () => {}, fetchImpl = fetch } = {}) {
     if (!db || !FieldValue) throw new Error('Firestore dependencies are required.');
     const apiKey = process.env.GEMINI_API_KEY;
@@ -627,6 +749,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     const coreFlights = new Map();
     const exampleFlights = new Map();
     const distractorFlights = new Map();
+    const successfulCompatibilityModes = new Map();
     const dictionaryRef = context => db.doc(`artifacts/${process.env.APP_ID || 'linguist-app-v7'}/public/data/global_dictionary/${dictionaryDocumentId(context.query, context.fromLang, context.toLang)}`);
 
     async function callModel({ model, thinkingLevel, body, timeoutMs, operation, uid = 'system' }) {
@@ -634,27 +757,54 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), timeoutMs);
         const started = performance.now();
-        let response; let data;
+        let response; let data; let schemaFallbackUsed = false;
         try {
-            const requestBody = clone(body);
-            requestBody.generationConfig = {
-                ...(requestBody.generationConfig || {}),
-                thinkingConfig:{ thinkingLevel }
-            };
-            response = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+            const schema = responseSchema(body);
+            const compatibilityKey = geminiCompatibilityKey(model, body);
+            const preferredMode = successfulCompatibilityModes.get(compatibilityKey);
+            const variants = buildGeminiCompatibilityRequests(body, thinkingLevel);
+            if (preferredMode) variants.sort((left, right) => Number(right.mode === preferredMode) - Number(left.mode === preferredMode));
+            const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+            const send = request => fetchImpl(endpoint, {
                 method:'POST', signal:controller.signal,
                 headers:{ 'Content-Type':'application/json', 'x-goog-api-key':apiKey },
-                body:JSON.stringify(requestBody)
+                body:JSON.stringify(request)
             });
-            data = await response.json().catch(() => ({}));
+            let selectedMode = variants[0]?.mode || 'structured';
+            let compatibilityRetries = 0;
+            const rejectedModes = [];
+            for (let index = 0; index < variants.length; index += 1) {
+                const variant = variants[index];
+                selectedMode = variant.mode;
+                response = await send(variant.body);
+                data = await response.json().catch(() => ({}));
+                if (response.ok) {
+                    compatibilityRetries = index;
+                    successfulCompatibilityModes.set(compatibilityKey, selectedMode);
+                    break;
+                }
+                if (!isGeminiInvalidArgument(response, data)) break;
+                rejectedModes.push(selectedMode);
+                compatibilityRetries = index + 1;
+            }
             if (!response.ok) {
+                if (isGeminiInvalidArgument(response, data)) {
+                    console.warn('Gemini rejected every compatible request form.', {
+                        model, operation, rejectedModes,
+                        providerStatus:data?.error?.status || 'INVALID_ARGUMENT',
+                        providerMessage:String(data?.error?.message || '').slice(0, 300)
+                    });
+                    const error = new Error('The translation model rejected its request configuration. Verify that Render uses the Tier 1 Gemini API key and the model variables shown in DEPLOYMENT.md.');
+                    error.status = 502; error.code = 'MODEL_REQUEST_INVALID'; throw error;
+                }
                 const error = new Error(data?.error?.message || `Gemini request failed (${response.status}).`);
                 error.status = response.status; error.code = 'MODEL_HTTP'; throw error;
             }
+            schemaFallbackUsed = !!schema && selectedMode !== 'structured';
             const latencyMs = Math.round(performance.now() - started);
             const tokens = usageMetrics(data);
-            recordUsage(uid, operation, { model, thinkingLevel, latencyMs, ...tokens }).catch(() => {});
-            return { data, model, thinkingLevel, latencyMs, tokens };
+            recordUsage(uid, operation, { model, thinkingLevel, latencyMs, schemaFallbackUsed, compatibilityMode:selectedMode, compatibilityRetries, ...tokens }).catch(() => {});
+            return { data, model, thinkingLevel, latencyMs, schemaFallbackUsed, compatibilityMode:selectedMode, compatibilityRetries, tokens };
         } catch (error) {
             if (error.name === 'AbortError') {
                 const timeoutError = new Error(`${model} timed out after ${timeoutMs} ms.`);
@@ -779,7 +929,12 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 fallbackUsed:!!fallback, fallbackReason,
                 contextsReady:contextsAreComplete(result, context),
                 latencyMs:Math.round(performance.now() - totalStart),
-                modelCalls:[primary, fallback].filter(Boolean).map(call => ({ model:call.model, thinkingLevel:call.thinkingLevel, latencyMs:call.latencyMs, ...call.tokens }))
+                modelCalls:[primary, fallback].filter(Boolean).map(call => ({
+                    model:call.model, thinkingLevel:call.thinkingLevel, latencyMs:call.latencyMs,
+                    schemaFallbackUsed:call.schemaFallbackUsed === true,
+                    compatibilityMode:call.compatibilityMode, compatibilityRetries:call.compatibilityRetries,
+                    ...call.tokens
+                }))
             }
         };
     }
@@ -881,7 +1036,12 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 fallbackReason:generated.filter(item => item.fallbackReason).map(item => item.fallbackReason).join(','),
                 preserveExamples:false, incrementUse:false
             });
-            const calls = generated.flatMap(item => item.modelCalls).map(call => ({ model:call.model, thinkingLevel:call.thinkingLevel, latencyMs:call.latencyMs, ...call.tokens }));
+            const calls = generated.flatMap(item => item.modelCalls).map(call => ({
+                model:call.model, thinkingLevel:call.thinkingLevel, latencyMs:call.latencyMs,
+                schemaFallbackUsed:call.schemaFallbackUsed === true,
+                compatibilityMode:call.compatibilityMode, compatibilityRetries:call.compatibilityRetries,
+                ...call.tokens
+            }));
             return {
                 contexts:saved.contexts,
                 meta:{ source:'generated', cacheStatus:'miss', contextsReady:true,
@@ -913,7 +1073,11 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             const distractors = cleanTextArray(response.result?.distractors, 4)
                 .filter(value => normalizeDictionaryQuery(value) !== correctKey).slice(0, context.count || 4);
             if (distractors.length < Math.min(2, context.count || 4)) throw Object.assign(new Error('Not enough realistic distractors were generated.'), { status:502 });
-            return { distractors, meta:{ model:response.model, thinkingLevel:response.thinkingLevel, latencyMs:response.latencyMs, ...response.tokens } };
+            return { distractors, meta:{
+                model:response.model, thinkingLevel:response.thinkingLevel, latencyMs:response.latencyMs,
+                compatibilityMode:response.compatibilityMode, compatibilityRetries:response.compatibilityRetries,
+                ...response.tokens
+            } };
         });
     }
 

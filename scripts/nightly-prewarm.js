@@ -4,7 +4,8 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import {
     PRIMARY_MODEL, PRIMARY_THINKING, DICTIONARY_SCHEMA_VERSION,
     buildCoreRequest, parseGeminiJSON, normalizeTranslationResult, coreQualityIssues,
-    dictionaryDocumentId, normalizeDictionaryQuery, createTranslationService
+    dictionaryDocumentId, normalizeDictionaryQuery, createTranslationService,
+    buildGeminiCompatibilityRequests
 } from '../translation-service.js';
 
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
@@ -113,11 +114,10 @@ async function geminiBatchRequest(path, init = {}) {
 async function submitBatch(candidates) {
     const requests = candidates.map((item, index) => {
         const request = buildCoreRequest(item.context);
-        request.generationConfig = {
-            ...request.generationConfig,
-            thinkingConfig:{ thinkingLevel:PRIMARY_THINKING }
-        };
-        return { request, metadata:{ key:`${index}:${dictionaryDocumentId(item.context.query, item.context.fromLang, item.context.toLang)}` } };
+        // The core schema is intentionally supplied as a prompt contract because
+        // Gemini may reject schemas of this complexity before a batch job starts.
+        const compatibleRequest = buildGeminiCompatibilityRequests(request, PRIMARY_THINKING)[0].body;
+        return { request:compatibleRequest, metadata:{ key:`${index}:${dictionaryDocumentId(item.context.query, item.context.fromLang, item.context.toLang)}` } };
     });
     return geminiBatchRequest(`models/${encodeURIComponent(PRIMARY_MODEL)}:batchGenerateContent`, {
         method:'POST', body:JSON.stringify({ batch:{
