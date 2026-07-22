@@ -5,12 +5,15 @@ import { getAuth } from 'firebase-admin/auth';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { Resend } from 'resend';
 import crypto from 'node:crypto';
+import {
+    LANGUAGES, PRIMARY_MODEL, PRIMARY_THINKING, FALLBACK_MODEL, FALLBACK_THINKING,
+    DICTIONARY_SCHEMA_VERSION, createTranslationService
+} from './translation-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
 const FEEDBACK_EMAIL_FROM = process.env.FEEDBACK_EMAIL_FROM || '';
 const allowedOrigins = (process.env.FRONTEND_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean);
@@ -122,24 +125,77 @@ function requireAdmin(req, res, next) {
 
 async function recordUsage(uid, operation, metadata = {}) {
     const day = new Date().toISOString().slice(0, 10); const ref = db.doc(`admin_metrics/api_usage/days/${day}`);
+    const latencyMs = Math.max(0, Number(metadata.latencyMs || 0));
+    const inputTokens = Math.max(0, Number(metadata.inputTokens || 0));
+    const visibleOutputTokens = Math.max(0, Number(metadata.visibleOutputTokens || 0));
+    const reasoningTokens = Math.max(0, Number(metadata.reasoningTokens || 0));
+    const totalTokens = Math.max(0, Number(metadata.totalTokens || inputTokens + visibleOutputTokens + reasoningTokens));
+    const modelKey = String(metadata.model || 'none').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
     await ref.set({
         day, updatedAt:FieldValue.serverTimestamp(), total:FieldValue.increment(1),
-        operations:{ [operation]:FieldValue.increment(1) }
+        operations:{ [operation]:FieldValue.increment(1) },
+        models:{ [modelKey]:FieldValue.increment(1) },
+        inputTokens:FieldValue.increment(inputTokens),
+        outputTokens:FieldValue.increment(visibleOutputTokens),
+        reasoningTokens:FieldValue.increment(reasoningTokens),
+        totalTokens:FieldValue.increment(totalTokens),
+        totalLatencyMs:FieldValue.increment(latencyMs),
+        fallbackCalls:FieldValue.increment(operation.includes('fallback') ? 1 : 0),
+        cacheHits:FieldValue.increment(operation === 'translation_cache_hit' ? 1 : 0)
     }, { merge:true });
     await db.collection('admin_metrics').doc('events').collection('items').add({
         uid, operation, metadata, timestamp:FieldValue.serverTimestamp()
     });
 }
 
-async function callGemini(body) {
+function measuredGeminiUsage(data, startedAt, model, thinkingLevel) {
+    const usage = data?.usageMetadata || {};
+    return {
+        model,
+        thinkingLevel,
+        latencyMs:Math.max(0, Math.round(performance.now() - startedAt)),
+        inputTokens:Number(usage.promptTokenCount || 0),
+        visibleOutputTokens:Number(usage.candidatesTokenCount || 0),
+        reasoningTokens:Number(usage.thoughtsTokenCount || 0),
+        totalTokens:Number(usage.totalTokenCount || 0)
+    };
+}
+
+const translationService = createTranslationService({ db, FieldValue, recordUsage });
+
+async function callGemini(body, { model = PRIMARY_MODEL, thinkingLevel = PRIMARY_THINKING, timeoutMs = 25_000 } = {}) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('Server misconfiguration: GEMINI_API_KEY is missing.');
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
-        method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify(body)
-    });
-    const data = await response.json();
-    if (!response.ok) { const error = new Error(data?.error?.message || 'Gemini request failed.'); error.status = response.status; throw error; }
-    return data;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const safeBody = JSON.parse(JSON.stringify(body || {}));
+        safeBody.generationConfig = {
+            ...(safeBody.generationConfig || {}),
+            thinkingConfig:{ thinkingLevel }
+        };
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+            method:'POST', signal:controller.signal,
+            headers:{ 'Content-Type':'application/json', 'x-goog-api-key':apiKey }, body:JSON.stringify(safeBody)
+        });
+        const data = await response.json();
+        if (!response.ok) { const error = new Error(data?.error?.message || 'Gemini request failed.'); error.status = response.status; throw error; }
+        return data;
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            const timeoutError = new Error(`${model} timed out.`); timeoutError.status = 504; throw timeoutError;
+        }
+        throw error;
+    } finally { clearTimeout(timeout); }
+}
+
+function translationContext(body) {
+    const query = String(body?.query || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').slice(0, 300);
+    const fromLang = String(body?.fromLang || '').trim().toUpperCase();
+    const toLang = String(body?.toLang || '').trim().toUpperCase();
+    if (!query) throw Object.assign(new Error('A word or expression is required.'), { status:400 });
+    if (!LANGUAGES[fromLang] || !LANGUAGES[toLang]) throw Object.assign(new Error('Unsupported source or destination language.'), { status:400 });
+    return { query, fromLang, toLang, definitionsOnly:body?.definitionsOnly === true || fromLang === toLang };
 }
 
 async function sendFeedbackNotification(feedbackId, feedback) {
@@ -201,7 +257,8 @@ async function resolveUserEmails(uids) {
 }
 
 app.get('/health', (_req, res) => res.json({
-    ok:true, service:'linguist-backend', model:GEMINI_MODEL,
+    ok:true, service:'linguist-backend', schemaVersion:DICTIONARY_SCHEMA_VERSION,
+    models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     feedbackEmailConfigured:!!(resend && FEEDBACK_EMAIL_FROM && FEEDBACK_EMAIL_TO)
 }));
 
@@ -217,11 +274,60 @@ app.post('/api/auth/email-exists', rateLimit({ windowMs:15 * 60_000, max:20, key
 
 app.post('/api/gemini', requireUser, rateLimit({ windowMs:60 * 60_000, max:80, key:req => `gemini:${req.user.uid}` }), async (req, res) => {
     try {
-        const data = await callGemini(req.body);
-        recordUsage(req.user.uid, 'gemini').catch(() => {});
+        let data;
+        let started = performance.now();
+        try {
+            data = await callGemini(req.body);
+            recordUsage(req.user.uid, 'gemini_primary', measuredGeminiUsage(data, started, PRIMARY_MODEL, PRIMARY_THINKING)).catch(() => {});
+        } catch (primaryError) {
+            recordUsage(req.user.uid, 'gemini_primary_error', {
+                model:PRIMARY_MODEL, thinkingLevel:PRIMARY_THINKING,
+                latencyMs:Math.max(0, Math.round(performance.now() - started)), errorCode:primaryError.code || 'REQUEST_FAILED'
+            }).catch(() => {});
+            started = performance.now();
+            data = await callGemini(req.body, { model:FALLBACK_MODEL, thinkingLevel:FALLBACK_THINKING });
+            recordUsage(req.user.uid, 'gemini_fallback', measuredGeminiUsage(data, started, FALLBACK_MODEL, FALLBACK_THINKING)).catch(() => {});
+        }
         res.json(data);
     } catch (error) {
         res.status(error.status || 500).json({ error:{ message:error.message } });
+    }
+});
+
+app.post('/api/translate', requireUser, rateLimit({ windowMs:60 * 60_000, max:120, key:req => `translate:${req.user.uid}` }), async (req, res) => {
+    try {
+        const context = translationContext(req.body);
+        const forceRefresh = req.body?.forceRefresh === true && (req.user.uid === ADMIN_UID || req.user.admin === true);
+        const response = await translationService.getCore(context, req.user.uid, { forceRefresh });
+        res.json(response);
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_FAILED' } });
+    }
+});
+
+app.post('/api/translate/contexts', requireUser, rateLimit({ windowMs:60 * 60_000, max:120, key:req => `contexts:${req.user.uid}` }), async (req, res) => {
+    try {
+        const context = translationContext(req.body);
+        res.json(await translationService.getContexts(context, req.user.uid));
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'CONTEXTS_FAILED' } });
+    }
+});
+
+app.post('/api/game/distractors', requireUser, rateLimit({ windowMs:60 * 60_000, max:30, key:req => `distractors:${req.user.uid}` }), async (req, res) => {
+    try {
+        const fromLang = String(req.body?.fromLang || '').trim().toUpperCase();
+        const toLang = String(req.body?.toLang || '').trim().toUpperCase();
+        const original = String(req.body?.original || '').trim().slice(0, 500);
+        const translated = String(req.body?.translated || '').trim().slice(0, 500);
+        const correct = String(req.body?.correct || '').trim().slice(0, 200);
+        const count = Math.min(4, Math.max(2, Number(req.body?.count || 4)));
+        if (!LANGUAGES[fromLang] || !LANGUAGES[toLang] || !original || !correct) {
+            return res.status(400).json({ error:{ message:'A valid quiz sentence, answer and language pair are required.' } });
+        }
+        res.json(await translationService.getDistractors({ fromLang, toLang, original, translated, correct, count }, req.user.uid));
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'DISTRACTORS_FAILED' } });
     }
 });
 
@@ -311,9 +417,16 @@ app.post('/api/jobs', requireUser, rateLimit({ windowMs:60 * 60_000, max:20, key
     res.status(202).json({ jobId:jobRef.id, status:'queued' });
     try {
         await jobRef.update({ status:'running', startedAt:FieldValue.serverTimestamp() });
-        const result = await callGemini(req.body);
+        let result; let operation = 'background_job_primary'; let model = PRIMARY_MODEL; let thinkingLevel = PRIMARY_THINKING;
+        let started = performance.now();
+        try { result = await callGemini(req.body); }
+        catch (_) {
+            operation = 'background_job_fallback'; model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
+            started = performance.now();
+            result = await callGemini(req.body, { model, thinkingLevel });
+        }
         await jobRef.update({ status:'completed', result, completedAt:FieldValue.serverTimestamp() });
-        recordUsage(req.user.uid, 'background_job').catch(() => {});
+        recordUsage(req.user.uid, operation, measuredGeminiUsage(result, started, model, thinkingLevel)).catch(() => {});
     } catch (error) {
         await jobRef.update({ status:'failed', error:error.message, completedAt:FieldValue.serverTimestamp() });
     }
@@ -331,13 +444,15 @@ app.post('/api/admin/bootstrap', requireUser, requireAdmin, async (req, res) => 
 });
 
 app.get('/api/admin/metrics', requireUser, requireAdmin, async (_req, res) => {
-    const [days, jobs] = await Promise.all([
+    const [days, jobs, events] = await Promise.all([
         db.collection('admin_metrics').doc('api_usage').collection('days').orderBy('day', 'desc').limit(30).get(),
-        db.collection('translation_jobs').orderBy('createdAt', 'desc').limit(50).get()
+        db.collection('translation_jobs').orderBy('createdAt', 'desc').limit(50).get(),
+        db.collection('admin_metrics').doc('events').collection('items').orderBy('timestamp', 'desc').limit(100).get()
     ]);
     res.json({
         usage:days.docs.map(document => ({ id:document.id, ...document.data() })),
-        jobs:jobs.docs.map(document => ({ id:document.id, ...document.data(), result:undefined }))
+        jobs:jobs.docs.map(document => ({ id:document.id, ...document.data(), result:undefined })),
+        events:events.docs.map(document => ({ id:document.id, ...document.data(), timestamp:timestampMillis(document.data().timestamp) }))
     });
 });
 
