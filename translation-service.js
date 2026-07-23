@@ -19,6 +19,7 @@ export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less com
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 
 export const DICTIONARY_SCHEMA_VERSION = 12;
+export const PREVIEW_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
 export const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
@@ -153,6 +154,40 @@ export const VALIDATION_RESPONSE_SCHEMA = Object.freeze({
     type:'object', additionalProperties:false,
     properties:CORE_RESPONSE_SCHEMA.properties.sourceLanguageValidation.properties,
     required:CORE_RESPONSE_SCHEMA.properties.sourceLanguageValidation.required
+});
+
+// This deliberately small contract gives the interface a useful first paint
+// while the complete dictionary record is generated independently.
+export const PREVIEW_RESPONSE_SCHEMA = Object.freeze({
+    type:'object', additionalProperties:false,
+    properties:{
+        detectedSourceLang:{ type:'string' },
+        sourceLanguageValidation:{
+            type:'object', additionalProperties:false,
+            properties:CORE_RESPONSE_SCHEMA.properties.sourceLanguageValidation.properties,
+            required:CORE_RESPONSE_SCHEMA.properties.sourceLanguageValidation.required
+        },
+        wordExists:{ type:'boolean' },
+        suggestedCorrection:{ type:'string' },
+        partOfSpeech:{ type:'string' },
+        formality:{ type:'string', enum:REGISTER_VALUES },
+        mainTranslation:textArray(4),
+        pronunciationGuide:{ type:'string' },
+        previewMeaning:{
+            type:'object', additionalProperties:false,
+            properties:{
+                partOfSpeech:{ type:'string' },
+                register:{ type:'string', enum:REGISTER_VALUES },
+                sourceDefinition:{ type:'string' },
+                targetDefinition:{ type:'string' }
+            },
+            required:['partOfSpeech', 'register', 'sourceDefinition', 'targetDefinition']
+        }
+    },
+    required:[
+        'detectedSourceLang', 'sourceLanguageValidation', 'wordExists', 'suggestedCorrection',
+        'partOfSpeech', 'formality', 'mainTranslation', 'pronunciationGuide', 'previewMeaning'
+    ]
 });
 
 export const EXAMPLES_RESPONSE_SCHEMA = Object.freeze({
@@ -345,15 +380,13 @@ export function stripLinguisticContent(result, context = {}) {
     };
 }
 
-export function normalizeTranslationResult(rawResult, context) {
-    const result = clone(rawResult) || {};
+function applyKnownLanguageMembership(validation, context) {
     const requested = cleanCode(context.fromLang);
-    let validation = normalizedValidation(result.sourceLanguageValidation, requested);
     const normalizedQuery = normalizeDictionaryQuery(context.query);
-
-    // "backend" is an established French technical borrowing as well as an English word.
+    // Keep the fast preview and complete-result decisions aligned for this
+    // established bilingual technical borrowing.
     if (normalizedQuery === 'backend' && requested === 'FR') {
-        validation = {
+        return {
             ...validation,
             existsInRequestedLanguage:true,
             validLanguages:[...new Set(['FR', 'EN', ...validation.validLanguages])],
@@ -364,6 +397,120 @@ export function normalizeTranslationResult(rawResult, context) {
             borrowingNote:validation.borrowingNote || 'Emprunt technique établi à l’anglais dans l’usage informatique français.'
         };
     }
+    return validation;
+}
+
+export function normalizePreviewResult(rawResult, context) {
+    const result = clone(rawResult) || {};
+    const requested = cleanCode(context.fromLang);
+    const validation = applyKnownLanguageMembership(
+        normalizedValidation(result.sourceLanguageValidation, requested),
+        context
+    );
+    const wordExists = validation.validLanguages.length > 0 || validation.existsInRequestedLanguage
+        ? true : result.wordExists === true;
+    const base = {
+        detectedSourceLang:cleanCode(result.detectedSourceLang) || validation.mostLikelyLanguage
+            || validation.mostLikelyAlternativeLanguage || requested,
+        sourceLanguageValidation:validation,
+        wordExists,
+        suggestedCorrection:cleanText(result.suggestedCorrection),
+        languageMismatch:validation.existsInRequestedLanguage === false
+            && !!(validation.mostLikelyAlternativeLanguage || validation.mostLikelyLanguage),
+        partOfSpeech:'',
+        formality:'',
+        mainTranslation:[],
+        pronunciationGuide:'',
+        previewMeaning:{ partOfSpeech:'', register:'', sourceDefinition:'', targetDefinition:'' },
+        definitionsOnly:context.definitionsOnly === true
+    };
+    if (!validation.existsInRequestedLanguage || !wordExists) return base;
+
+    const formality = normalizeRegister(result.formality);
+    const meaning = result.previewMeaning || {};
+    const normalized = {
+        ...base,
+        languageMismatch:false,
+        partOfSpeech:cleanText(result.partOfSpeech),
+        formality,
+        mainTranslation:cleanTextArray(result.mainTranslation, 4),
+        pronunciationGuide:cleanText(result.pronunciationGuide),
+        previewMeaning:{
+            partOfSpeech:cleanText(meaning.partOfSpeech) || cleanText(result.partOfSpeech),
+            register:normalizeRegister(meaning.register, formality),
+            sourceDefinition:cleanText(meaning.sourceDefinition),
+            targetDefinition:cleanText(meaning.targetDefinition)
+        }
+    };
+    if (context.definitionsOnly) {
+        normalized.mainTranslation = [];
+        normalized.previewMeaning.targetDefinition = '';
+    }
+    return normalized;
+}
+
+export function previewFromCore(coreResult, context) {
+    const core = normalizeTranslationResult(coreResult, context);
+    const firstMeaning = core?.meanings?.[0] || {};
+    return normalizePreviewResult({
+        detectedSourceLang:core?.detectedSourceLang || '',
+        sourceLanguageValidation:core?.sourceLanguageValidation || {},
+        wordExists:core?.wordExists === true,
+        suggestedCorrection:core?.suggestedCorrection || '',
+        partOfSpeech:core?.partOfSpeech || '',
+        formality:firstMeaning.register || core?.formality || 'Neutral',
+        mainTranslation:core?.mainTranslation || [],
+        pronunciationGuide:core?.pronunciationGuide || '',
+        previewMeaning:{
+            partOfSpeech:firstMeaning.partOfSpeech || core?.partOfSpeech || '',
+            register:firstMeaning.register || core?.formality || 'Neutral',
+            sourceDefinition:firstMeaning.sourceDefinition || core?.definitions?.sourceLang?.[0] || '',
+            targetDefinition:firstMeaning.targetDefinition || core?.definitions?.targetLang?.[0] || ''
+        }
+    }, context);
+}
+
+function previewHasLinguisticContent(result) {
+    return hasText(result?.partOfSpeech) || hasText(result?.formality)
+        || hasText(result?.pronunciationGuide) || result?.mainTranslation?.some(hasText)
+        || hasText(result?.previewMeaning?.sourceDefinition)
+        || hasText(result?.previewMeaning?.targetDefinition);
+}
+
+export function previewQualityIssues(result, context) {
+    const issues = [];
+    if (!result || typeof result !== 'object') return ['empty preview'];
+    const validation = result.sourceLanguageValidation;
+    if (!validation || validation.requestedLanguage !== cleanCode(context.fromLang)) {
+        issues.push('invalid requested-language validation');
+    }
+    if (!hasText(validation?.decisionReason)) issues.push('missing language decision reason');
+    if (validation?.existsInRequestedLanguage === false || result.wordExists === false) {
+        if (previewHasLinguisticContent(result)) issues.push('rejected preview contains linguistic content');
+        return issues;
+    }
+    const definitionsOnly = context.definitionsOnly === true;
+    if (!result.wordExists) issues.push('accepted preview marked nonexistent');
+    if (!hasText(result.partOfSpeech)) issues.push('missing preview part of speech');
+    if (!REGISTER_VALUES.includes(result.formality)) issues.push('missing preview register');
+    if (!definitionsOnly && !result.mainTranslation?.some(hasText)) issues.push('missing preview translation');
+    if (!hasText(result.pronunciationGuide)) issues.push('missing preview pronunciation');
+    if (!hasText(result.previewMeaning?.partOfSpeech)
+        || !REGISTER_VALUES.includes(result.previewMeaning?.register)
+        || !hasText(result.previewMeaning?.sourceDefinition)
+        || (!definitionsOnly && !hasText(result.previewMeaning?.targetDefinition))) {
+        issues.push('missing or incomplete preview meaning');
+    }
+    return issues;
+}
+
+export function normalizeTranslationResult(rawResult, context) {
+    const result = clone(rawResult) || {};
+    const requested = cleanCode(context.fromLang);
+    const validation = applyKnownLanguageMembership(
+        normalizedValidation(result.sourceLanguageValidation, requested),
+        context
+    );
 
     result.sourceLanguageValidation = validation;
     // A known valid-language observation proves that the input exists somewhere, even when it is a source mismatch.
@@ -558,6 +705,33 @@ export function contextsAreComplete(result, context) {
     const expected = examplesPerContext(contexts.length);
     return contexts.every(item => Array.isArray(item.examples) && item.examples.length === expected
         && item.examples.every(example => exampleQualityIssues(example, context).length === 0));
+}
+
+export function buildPreviewRequest(context, { repairSource = null } = {}) {
+    const fromName = LANGUAGES[cleanCode(context.fromLang)];
+    const toName = LANGUAGES[cleanCode(context.toLang)];
+    const definitionsOnly = context.definitionsOnly === true;
+    const repairInstruction = repairSource
+        ? `\nRepair these preview-gate issues: ${repairSource.issues.join('; ')}. Do not repeat them.\nDraft preview JSON:\n${JSON.stringify(repairSource.result)}`
+        : '';
+    const system = `You are Qelumi's fast multilingual dictionary preview engine. Analyse the exact input, never a corrected substitute. Return only the small preview requested by the schema; do not generate etymology, conjugations, synonyms, related phrases, regional variants, word families, contexts or examples.
+
+First decide whether the exact input is genuinely established in requested source ${fromName} (${context.fromLang}). Grammatical sentences, established loanwords, expressions, specialised terms, and well-established fictional or cultural proper names qualify. Language origin is not language membership. Shared established words such as apocalypse and saboteur qualify in English and French. "backend" is established specialised French as well as English. The offensive English clipping "tard" does not qualify as the ordinary English entry; French "tard" does.
+
+Validation fields must be internally consistent. validLanguages is supporting evidence and need not be exhaustive. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish. If existsInRequestedLanguage=false, leave partOfSpeech, formality, mainTranslation, pronunciationGuide and every previewMeaning field empty. Do not translate a source-language mismatch.
+
+For an accepted entry, return every established part of speech in partOfSpeech, one concise pronunciation guide, ${definitionsOnly ? 'no translation' : `one to four useful ${toName} translations`}, and one concise source-language definition for the most common sense. ${definitionsOnly ? 'Keep targetDefinition empty.' : `Give a faithful ${toName} targetDefinition.`} Include the exact part of speech and register for that meaning.
+
+Write sourceDefinition in ${fromName}. ${definitionsOnly ? 'Keep mainTranslation and targetDefinition empty.' : `Write mainTranslation and targetDefinition in ${toName}.`} Use only these language codes: ${Object.keys(LANGUAGES).join(', ')}. Return strict JSON matching the schema.${repairInstruction}`;
+    return {
+        contents:[{ role:'user', parts:[{ text:`Exact input: ${context.query}\nRequested source: ${fromName} (${context.fromLang})\nDestination: ${toName} (${context.toLang})` }] }],
+        systemInstruction:{ parts:[{ text:system }] },
+        generationConfig:{
+            responseMimeType:'application/json',
+            responseJsonSchema:PREVIEW_RESPONSE_SCHEMA,
+            maxOutputTokens:2200
+        }
+    };
 }
 
 export function buildCoreRequest(context, { repairSource = null } = {}) {
@@ -803,11 +977,49 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     const mismatchTtlMs = Math.max(60_000, Number(process.env.DICTIONARY_MISMATCH_TTL_MS || 12 * 60 * 60_000));
     const primaryTimeoutMs = Math.max(2_000, Number(process.env.GEMINI_PRIMARY_TIMEOUT_MS || 15_000));
     const fallbackTimeoutMs = Math.max(2_000, Number(process.env.GEMINI_FALLBACK_TIMEOUT_MS || 25_000));
+    const previewPrimaryTimeoutMs = Math.max(2_000, Number(process.env.GEMINI_PREVIEW_PRIMARY_TIMEOUT_MS || Math.min(primaryTimeoutMs, 8_000)));
+    const previewFallbackTimeoutMs = Math.max(2_000, Number(process.env.GEMINI_PREVIEW_FALLBACK_TIMEOUT_MS || Math.min(fallbackTimeoutMs, 12_000)));
+    const cacheReadTimeoutMs = Math.max(1_000, Number(process.env.DICTIONARY_READ_TIMEOUT_MS || 4_000));
+    const cacheWriteTimeoutMs = Math.max(1_000, Number(process.env.DICTIONARY_WRITE_TIMEOUT_MS || 5_000));
+    const previewFlights = new Map();
     const coreFlights = new Map();
     const exampleFlights = new Map();
     const distractorFlights = new Map();
     const successfulCompatibilityModes = new Map();
     const dictionaryRef = context => db.doc(`artifacts/${process.env.APP_ID || 'linguist-app-v7'}/public/data/global_dictionary/${dictionaryDocumentId(context.query, context.fromLang, context.toLang)}`);
+
+    function withDeadline(promise, timeoutMs, label) {
+        let timer;
+        return Promise.race([
+            Promise.resolve(promise),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    const error = new Error(`${label} timed out after ${timeoutMs} ms.`);
+                    error.code = 'DEPENDENCY_TIMEOUT';
+                    reject(error);
+                }, timeoutMs);
+            })
+        ]).finally(() => clearTimeout(timer));
+    }
+
+    async function readDictionary(ref, operation = 'Dictionary lookup') {
+        try {
+            return await withDeadline(ref.get(), cacheReadTimeoutMs, operation);
+        } catch (error) {
+            console.warn(`${operation} skipped.`, error.message);
+            return null;
+        }
+    }
+
+    async function writeDictionary(ref, value, options, operation = 'Dictionary write') {
+        try {
+            await withDeadline(ref.set(value, options), cacheWriteTimeoutMs, operation);
+            return true;
+        } catch (error) {
+            console.warn(`${operation} did not delay the translation response.`, error.message);
+            return false;
+        }
+    }
 
     async function callModel({ model, thinkingLevel, body, timeoutMs, operation, uid = 'system', metrics = {} }) {
         if (!apiKey) throw Object.assign(new Error('Server misconfiguration: GEMINI_API_KEY is missing.'), { status:500 });
@@ -889,15 +1101,54 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         } catch (_) { return { stored, result:null, updatedAt:0 }; }
     }
 
+    function parseStoredPreview(snapshot, context) {
+        if (!snapshot?.exists) return null;
+        const stored = snapshot.data();
+        if (stored.previewJSON == null && stored.preview == null) return null;
+        try {
+            const raw = typeof stored.previewJSON === 'string' ? JSON.parse(stored.previewJSON) : stored.preview;
+            const preview = normalizePreviewResult(raw, context);
+            return {
+                stored,
+                preview,
+                updatedAt:timestampMillis(stored.previewUpdatedAt),
+                expiresAt:Number(stored.previewExpiresAt || 0)
+            };
+        } catch (_) { return null; }
+    }
+
+    async function savePreview(context, preview, metadata = {}) {
+        const ref = dictionaryRef(context);
+        const now = Date.now();
+        const accepted = preview?.sourceLanguageValidation?.existsInRequestedLanguage === true
+            && preview.wordExists === true;
+        await writeDictionary(ref, {
+            queryLower:normalizeDictionaryQuery(context.query),
+            originalQuery:context.query,
+            fromLang:context.fromLang,
+            toLang:context.toLang,
+            previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
+            previewJSON:JSON.stringify(preview),
+            previewModel:metadata.model || '',
+            previewFallbackModel:metadata.fallbackModel || '',
+            previewFallbackUsed:metadata.fallbackUsed === true,
+            previewFallbackReason:metadata.fallbackReason || '',
+            previewUpdatedAt:now,
+            previewExpiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs)
+        }, { merge:true }, 'Preview-cache write');
+        return preview;
+    }
+
     async function saveCachedResult(context, result, metadata = {}) {
         const ref = dictionaryRef(context);
-        const previousSnapshot = await ref.get();
+        const previousSnapshot = await readDictionary(ref, 'Dictionary merge lookup');
         const previous = parseStored(previousSnapshot, context)?.result;
         const merged = metadata.preserveExamples === false ? result : mergeContextExamples(clone(result), previous);
         const now = Date.now();
         const contextsComplete = contextsAreComplete(merged, context);
         const accepted = merged?.sourceLanguageValidation?.existsInRequestedLanguage === true && merged.wordExists === true;
-        await ref.set({
+        const preview = previewFromCore(merged, context);
+        await writeDictionary(ref, {
             queryLower:normalizeDictionaryQuery(context.query), originalQuery:context.query,
             fromLang:context.fromLang, toLang:context.toLang,
             schemaVersion:DICTIONARY_SCHEMA_VERSION, modelVersion:DICTIONARY_SCHEMA_VERSION,
@@ -912,9 +1163,172 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             updatedAt:now, refreshedAt:FieldValue.serverTimestamp(),
             expiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs),
             staleUntil:now + (accepted ? staleTtlMs : mismatchTtlMs),
+            previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
+            previewJSON:JSON.stringify(preview),
+            previewModel:metadata.model || '',
+            previewFallbackModel:metadata.fallbackModel || '',
+            previewFallbackUsed:metadata.fallbackUsed === true,
+            previewFallbackReason:metadata.fallbackReason || '',
+            previewUpdatedAt:now,
+            previewExpiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs),
             useCount:FieldValue.increment(metadata.incrementUse === false ? 0 : 1)
-        }, { merge:true });
+        }, { merge:true }, 'Dictionary write');
         return merged;
+    }
+
+    async function generatePreview(context, uid) {
+        const totalStart = performance.now();
+        let primary; let fallback; let result; let primaryError;
+        let issues = []; let fallbackReason = '';
+        try {
+            primary = await modelJSON({
+                model:PRIMARY_MODEL,
+                thinkingLevel:PRIMARY_THINKING,
+                body:buildPreviewRequest(context),
+                timeoutMs:previewPrimaryTimeoutMs,
+                operation:'translation_preview_primary',
+                uid,
+                metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+            });
+            const contradictions = rawLanguageContradictions(primary.result, context.fromLang);
+            result = normalizePreviewResult(primary.result, context);
+            issues = previewQualityIssues(result, context);
+            const ambiguous = isGenuinelyAmbiguous(result);
+            if (contradictions.length || ambiguous) {
+                issues.push(...contradictions, ...(ambiguous ? ['genuine language ambiguity'] : []));
+                fallbackReason = contradictions.length
+                    ? 'preview_language_validation_contradiction'
+                    : 'preview_language_ambiguity';
+            }
+        } catch (error) {
+            primaryError = error;
+            fallbackReason = error.code || 'preview_primary_failed';
+        }
+
+        if (!result || issues.length || primaryError) {
+            const repairIssues = [
+                ...issues,
+                ...(primaryError ? [`primary request: ${primaryError.code || primaryError.message || 'failed'}`] : [])
+            ];
+            fallback = await modelJSON({
+                model:FALLBACK_MODEL,
+                thinkingLevel:FALLBACK_THINKING,
+                body:buildPreviewRequest(context, result ? { repairSource:{ result, issues:repairIssues } } : undefined),
+                timeoutMs:previewFallbackTimeoutMs,
+                operation:'translation_preview_fallback',
+                uid,
+                metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+            });
+            result = normalizePreviewResult(fallback.result, context);
+            issues = previewQualityIssues(result, context);
+            fallbackReason = fallbackReason || `preview_quality:${repairIssues.join('|')}`;
+        }
+
+        if (issues.length) {
+            const error = new Error(`The translation preview was incomplete: ${issues.join(', ')}.`);
+            error.status = 502;
+            error.code = 'PREVIEW_SCHEMA_INCOMPLETE';
+            throw error;
+        }
+        // Cache delivery is useful but must never delay the first visible answer.
+        savePreview(context, result, {
+            model:primary?.model || fallback?.model || '',
+            fallbackModel:fallback?.model || '',
+            fallbackUsed:!!fallback,
+            fallbackReason
+        }).catch(error => console.warn('Preview cache persistence failed.', error.message));
+        const modelCalls = [primary, fallback].filter(Boolean);
+        return {
+            preview:result,
+            meta:{
+                phase:'preview',
+                source:'generated',
+                cacheStatus:'miss',
+                previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
+                primaryModel:PRIMARY_MODEL,
+                primaryThinking:PRIMARY_THINKING,
+                fallbackModel:FALLBACK_MODEL,
+                fallbackThinking:FALLBACK_THINKING,
+                fallbackUsed:!!fallback,
+                fallbackReason,
+                latencyMs:Math.round(performance.now() - totalStart),
+                modelCalls:modelCalls.map(call => ({
+                    model:call.model,
+                    thinkingLevel:call.thinkingLevel,
+                    latencyMs:call.latencyMs,
+                    schemaFallbackUsed:call.schemaFallbackUsed === true,
+                    compatibilityMode:call.compatibilityMode,
+                    compatibilityRetries:call.compatibilityRetries,
+                    ...call.tokens
+                }))
+            }
+        };
+    }
+
+    async function getPreview(context, uid) {
+        const started = performance.now();
+        const ref = dictionaryRef(context);
+        const snapshot = await readDictionary(ref, 'Preview-cache lookup');
+        const cacheLookupMs = Math.round(performance.now() - started);
+        const now = Date.now();
+        const cachedCore = parseStored(snapshot, context);
+        if (cachedCore?.result) {
+            const age = cachedCore.updatedAt ? now - cachedCore.updatedAt : Infinity;
+            const accepted = cachedCore.result?.sourceLanguageValidation?.existsInRequestedLanguage === true
+                && cachedCore.result.wordExists === true;
+            const negativeExpiry = Number(cachedCore.stored?.expiresAt || 0);
+            const derived = previewFromCore(cachedCore.result, context);
+            if (age <= staleTtlMs && (accepted || negativeExpiry > now)
+                && previewQualityIssues(derived, context).length === 0) {
+                recordUsage(uid, 'translation_preview_cache_hit', {
+                    cacheStatus:'full_dictionary', cacheLookupMs, latencyMs:cacheLookupMs,
+                    fromLang:context.fromLang, toLang:context.toLang
+                }).catch(() => {});
+                return {
+                    preview:derived,
+                    meta:{
+                        phase:'preview',
+                        source:'global_dictionary',
+                        cacheStatus:age <= freshTtlMs ? 'fresh' : 'stale',
+                        previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
+                        cacheLookupMs,
+                        latencyMs:cacheLookupMs,
+                        fallbackUsed:false,
+                        modelCalls:[]
+                    }
+                };
+            }
+        }
+
+        const cachedPreview = parseStoredPreview(snapshot, context);
+        if (cachedPreview?.preview
+            && Number(cachedPreview.stored?.previewSchemaVersion || 0) >= PREVIEW_SCHEMA_VERSION
+            && cachedPreview.expiresAt > now
+            && previewQualityIssues(cachedPreview.preview, context).length === 0) {
+            recordUsage(uid, 'translation_preview_cache_hit', {
+                cacheStatus:'preview', cacheLookupMs, latencyMs:cacheLookupMs,
+                fromLang:context.fromLang, toLang:context.toLang
+            }).catch(() => {});
+            return {
+                preview:cachedPreview.preview,
+                meta:{
+                    phase:'preview',
+                    source:'preview_cache',
+                    cacheStatus:'fresh',
+                    previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
+                    cacheLookupMs,
+                    latencyMs:cacheLookupMs,
+                    fallbackUsed:false,
+                    modelCalls:[]
+                }
+            };
+        }
+
+        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
+        const generated = await singleFlight(previewFlights, flightKey, () => generatePreview(context, uid));
+        generated.meta.cacheLookupMs = cacheLookupMs;
+        generated.meta.latencyMs = Math.round(performance.now() - started);
+        return generated;
     }
 
     async function generateCore(context, uid, prior = null) {
@@ -1005,7 +1419,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     async function getCore(context, uid, { forceRefresh = false, touch = true } = {}) {
         const started = performance.now();
         const ref = dictionaryRef(context);
-        const snapshot = await ref.get();
+        const snapshot = await readDictionary(ref);
         const cacheLookupMs = Math.round(performance.now() - started);
         const cached = parseStored(snapshot, context);
         const cachedIssues = cached?.result ? coreQualityIssues(cached.result, context) : ['cache miss'];
@@ -1165,8 +1579,9 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     }
 
     return {
-        getCore, getContexts, getDistractors, saveCachedResult,
+        getPreview, getCore, getContexts, getDistractors, saveCachedResult,
         models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
-        cache:{ freshTtlMs, staleTtlMs, mismatchTtlMs }
+        cache:{ freshTtlMs, staleTtlMs, mismatchTtlMs, cacheReadTimeoutMs, cacheWriteTimeoutMs },
+        previewSchemaVersion:PREVIEW_SCHEMA_VERSION
     };
 }

@@ -1,6 +1,6 @@
 {
   "name": "qelumi-server",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Secure Qelumi translation, learning, feedback and administration backend",
   "main": "server.js",
   "type": "module",
