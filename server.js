@@ -7,13 +7,13 @@ import { Resend } from 'resend';
 import crypto from 'node:crypto';
 import {
     LANGUAGES, PRIMARY_MODEL, PRIMARY_THINKING, FALLBACK_MODEL, FALLBACK_THINKING,
-    DICTIONARY_SCHEMA_VERSION, createTranslationService, buildGeminiCompatibilityRequests,
+    DICTIONARY_SCHEMA_VERSION, PREVIEW_SCHEMA_VERSION, createTranslationService, buildGeminiCompatibilityRequests,
     geminiCompatibilityKey, isGeminiInvalidArgument
 } from './translation-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '3.3.0';
+const BACKEND_VERSION = '3.5.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -282,6 +282,7 @@ async function resolveUserEmails(uids) {
 app.get('/health', (_req, res) => res.json({
     ok:true, service:'linguist-backend', version:BACKEND_VERSION, schemaVersion:DICTIONARY_SCHEMA_VERSION,
     requestCompatibility:'adaptive-json-v2',
+    progressiveTranslation:{ enabled:true, previewSchemaVersion:PREVIEW_SCHEMA_VERSION },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     feedbackEmailConfigured:!!(resend && FEEDBACK_EMAIL_FROM && FEEDBACK_EMAIL_TO)
 }));
@@ -326,6 +327,15 @@ app.post('/api/translate', requireUser, rateLimit({ windowMs:60 * 60_000, max:12
         res.json(response);
     } catch (error) {
         res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_FAILED' } });
+    }
+});
+
+app.post('/api/translate/preview', requireUser, rateLimit({ windowMs:60 * 60_000, max:180, key:req => `translation-preview:${req.user.uid}` }), async (req, res) => {
+    try {
+        const context = translationContext(req.body);
+        res.json(await translationService.getPreview(context, req.user.uid));
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'PREVIEW_FAILED' } });
     }
 });
 
