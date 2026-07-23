@@ -7,18 +7,24 @@ import { Resend } from 'resend';
 import crypto from 'node:crypto';
 import {
     LANGUAGES, PRIMARY_MODEL, PRIMARY_THINKING, FALLBACK_MODEL, FALLBACK_THINKING,
-    DICTIONARY_SCHEMA_VERSION, PREVIEW_SCHEMA_VERSION, createTranslationService, buildGeminiCompatibilityRequests,
-    geminiCompatibilityKey, isGeminiInvalidArgument
+    DICTIONARY_SCHEMA_VERSION, createTranslationService, buildGeminiCompatibilityRequests,
+    geminiCompatibilityKey, isGeminiInvalidArgument, parseGeminiJSON, dictionaryDocumentId,
+    normalizeTranslationResult, coreQualityIssues
 } from './translation-service.js';
+import {
+    buildLearningRequest, correctionDocumentId, sanitizeCorrectionValue,
+    summarizePerformanceEvents
+} from './learning-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '3.5.2';
+const BACKEND_VERSION = '4.0.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
 const FEEDBACK_EMAIL_FROM = process.env.FEEDBACK_EMAIL_FROM || '';
 const allowedOrigins = (process.env.FRONTEND_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean);
+const nativeOrigins = new Set(['capacitor://localhost', 'https://localhost', 'http://localhost']);
 const feedbackCategories = new Set(['suggestion', 'glitch', 'translation', 'other']);
 const feedbackStatuses = new Set(['new', 'read', 'closed']);
 const translationSources = new Set(['generated', 'dictionary_repair', 'global_dictionary', 'personal_history', 'image_analysis', 'language_validation']);
@@ -39,6 +45,7 @@ const db = getFirestore();
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const feedbackCollection = () => db.collection('artifacts').doc(APP_ID).collection('public').doc('data').collection('feedback');
+const correctionsCollection = () => db.collection('artifacts').doc(APP_ID).collection('public').doc('data').collection('corrections');
 const translationSearchCollection = () => db.collection('admin_metrics').doc('translation_searches').collection('items');
 const timestampMillis = value => value?.toMillis?.() || Number(value) || 0;
 const htmlEscape = value => String(value ?? '').replace(/[&<>"']/g, character => ({
@@ -53,6 +60,12 @@ const sourceLabel = value => ({
     personal_history:'Already in user history', image_analysis:'New image analysis',
     language_validation:'Language validation'
 }[value] || 'Unknown');
+const correctionSections = new Set([
+    'mainTranslation', 'pronunciationGuide', 'partOfSpeech', 'formality', 'learningMetadata',
+    'etymology', 'conjugationGroups', 'definitions', 'meanings', 'synonyms',
+    'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes',
+    'regionalVariants', 'wordFamily', 'contexts'
+]);
 
 app.disable('x-powered-by');
 
@@ -89,7 +102,7 @@ app.post('/api/webhooks/resend', express.raw({ type:'application/json', limit:'1
 });
 
 app.use(cors({ origin(origin, callback) {
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) return callback(null, true);
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin) || nativeOrigins.has(origin)) return callback(null, true);
     return callback(new Error('Origin not allowed'));
 } }));
 app.use(express.json({ limit:'10mb' }));
@@ -133,6 +146,12 @@ async function recordUsage(uid, operation, metadata = {}) {
     const reasoningTokens = Math.max(0, Number(metadata.reasoningTokens || 0));
     const totalTokens = Math.max(0, Number(metadata.totalTokens || inputTokens + visibleOutputTokens + reasoningTokens));
     const modelKey = String(metadata.model || 'none').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
+    const pricingPrefix = metadata.model === FALLBACK_MODEL ? 'GEMINI_FALLBACK' : 'GEMINI_PRIMARY';
+    const inputRate = Math.max(0, Number(process.env[`${pricingPrefix}_INPUT_USD_PER_MILLION`] || 0));
+    const outputRate = Math.max(0, Number(process.env[`${pricingPrefix}_OUTPUT_USD_PER_MILLION`] || 0));
+    const estimatedCostUsd = Math.max(0, Number(metadata.estimatedCostUsd
+        ?? ((inputTokens * inputRate + (visibleOutputTokens + reasoningTokens) * outputRate) / 1_000_000)));
+    const eventMetadata = { ...metadata, latencyMs, inputTokens, visibleOutputTokens, reasoningTokens, totalTokens, estimatedCostUsd };
     await ref.set({
         day, updatedAt:FieldValue.serverTimestamp(), total:FieldValue.increment(1),
         operations:{ [operation]:FieldValue.increment(1) },
@@ -142,11 +161,12 @@ async function recordUsage(uid, operation, metadata = {}) {
         reasoningTokens:FieldValue.increment(reasoningTokens),
         totalTokens:FieldValue.increment(totalTokens),
         totalLatencyMs:FieldValue.increment(latencyMs),
+        estimatedCostUsd:FieldValue.increment(estimatedCostUsd),
         fallbackCalls:FieldValue.increment(operation.includes('fallback') ? 1 : 0),
         cacheHits:FieldValue.increment(operation === 'translation_cache_hit' ? 1 : 0)
     }, { merge:true });
     await db.collection('admin_metrics').doc('events').collection('items').add({
-        uid, operation, metadata, timestamp:FieldValue.serverTimestamp()
+        uid, operation, metadata:eventMetadata, timestamp:FieldValue.serverTimestamp()
     });
 }
 
@@ -210,6 +230,43 @@ async function callGemini(body, { model = PRIMARY_MODEL, thinkingLevel = PRIMARY
         }
         throw error;
     } finally { clearTimeout(timeout); }
+}
+
+async function runLearningFeature(feature, input, uid) {
+    const body = buildLearningRequest(feature, input);
+    const languageMetrics = {
+        fromLang:String(input?.sourceLang || input?.practiceLang || input?.language || '').toUpperCase(),
+        toLang:String(input?.targetLang || input?.supportLang || input?.language || '').toUpperCase(),
+        feature
+    };
+    let data; let result; let model = PRIMARY_MODEL; let thinkingLevel = PRIMARY_THINKING;
+    let operation = `learning_${feature}_primary`;
+    let started = performance.now(); let fallbackUsed = false;
+    try {
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:25_000 });
+        result = parseGeminiJSON(data);
+    } catch (primaryError) {
+        recordUsage(uid, `${operation}_error`, {
+            ...languageMetrics, model, thinkingLevel,
+            latencyMs:Math.max(0, Math.round(performance.now() - started)),
+            errorCode:primaryError.code || 'REQUEST_FAILED'
+        }).catch(() => {});
+        fallbackUsed = true;
+        model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
+        operation = `learning_${feature}_fallback`;
+        started = performance.now();
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:35_000 });
+        result = parseGeminiJSON(data);
+    }
+    const usage = { ...measuredGeminiUsage(data, started, model, thinkingLevel), ...languageMetrics };
+    recordUsage(uid, operation, usage).catch(() => {});
+    return {
+        result,
+        meta:{
+            feature, model, thinkingLevel, fallbackUsed,
+            latencyMs:usage.latencyMs
+        }
+    };
 }
 
 function translationContext(body) {
@@ -282,9 +339,17 @@ async function resolveUserEmails(uids) {
 app.get('/health', (_req, res) => res.json({
     ok:true, service:'linguist-backend', version:BACKEND_VERSION, schemaVersion:DICTIONARY_SCHEMA_VERSION,
     requestCompatibility:'adaptive-json-v2',
-    progressiveTranslation:{ enabled:true, previewSchemaVersion:PREVIEW_SCHEMA_VERSION },
+    learningFeatures:{
+        contextLens:true, mistakes:true, shadowing:true, conversations:true,
+        stories:true, cefr:true, writingCoach:true, verifiedCorrections:true,
+        mobileBridge:true, performanceDashboard:true
+    },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
-    feedbackEmailConfigured:!!(resend && FEEDBACK_EMAIL_FROM && FEEDBACK_EMAIL_TO)
+    feedbackEmailConfigured:!!(resend && FEEDBACK_EMAIL_FROM && FEEDBACK_EMAIL_TO),
+    costRatesConfigured:!!(
+        Number(process.env.GEMINI_PRIMARY_INPUT_USD_PER_MILLION || 0)
+        && Number(process.env.GEMINI_PRIMARY_OUTPUT_USD_PER_MILLION || 0)
+    )
 }));
 
 app.post('/api/auth/email-exists', rateLimit({ windowMs:15 * 60_000, max:20, key:req => `email:${req.ip}` }), async (req, res) => {
@@ -330,15 +395,6 @@ app.post('/api/translate', requireUser, rateLimit({ windowMs:60 * 60_000, max:12
     }
 });
 
-app.post('/api/translate/preview', requireUser, rateLimit({ windowMs:60 * 60_000, max:180, key:req => `translation-preview:${req.user.uid}` }), async (req, res) => {
-    try {
-        const context = translationContext(req.body);
-        res.json(await translationService.getPreview(context, req.user.uid));
-    } catch (error) {
-        res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'PREVIEW_FAILED' } });
-    }
-});
-
 app.post('/api/translate/contexts', requireUser, rateLimit({ windowMs:60 * 60_000, max:120, key:req => `contexts:${req.user.uid}` }), async (req, res) => {
     try {
         const context = translationContext(req.body);
@@ -364,6 +420,32 @@ app.post('/api/game/distractors', requireUser, rateLimit({ windowMs:60 * 60_000,
         res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'DISTRACTORS_FAILED' } });
     }
 });
+
+const learningRoute = feature => async (req, res) => {
+    try {
+        res.json(await runLearningFeature(feature, req.body || {}, req.user.uid));
+    } catch (error) {
+        res.status(error.status || 500).json({
+            error:{ message:error.message, code:error.code || `LEARNING_${feature.toUpperCase()}_FAILED` }
+        });
+    }
+};
+
+app.post('/api/learning/context-lens', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:50, key:req => `context-lens:${req.user.uid}` }),
+    learningRoute('context_lens'));
+app.post('/api/learning/shadowing', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:30, key:req => `shadowing:${req.user.uid}` }),
+    learningRoute('shadowing'));
+app.post('/api/learning/conversation', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:100, key:req => `conversation:${req.user.uid}` }),
+    learningRoute('conversation'));
+app.post('/api/learning/story', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:20, key:req => `story:${req.user.uid}` }),
+    learningRoute('story'));
+app.post('/api/learning/writing-coach', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:40, key:req => `writing-coach:${req.user.uid}` }),
+    learningRoute('writing_coach'));
 
 app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10, key:req => `feedback:${req.user.uid}` }), async (req, res) => {
     const category = feedbackCategories.has(req.body?.category) ? req.body.category : (feedbackCategories.has(req.body?.type) ? req.body.type : 'other');
@@ -410,6 +492,51 @@ app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10,
         });
         res.status(201).json({ ok:true, id:feedbackRef.id, notificationStatus:status });
     }
+});
+
+app.post('/api/corrections', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:20, key:req => `corrections:${req.user.uid}` }),
+    async (req, res) => {
+        try {
+            const query = String(req.body?.query || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').slice(0, 300);
+            const fromLang = String(req.body?.fromLang || '').trim().toUpperCase();
+            const toLang = String(req.body?.toLang || '').trim().toUpperCase();
+            const section = String(req.body?.section || '').trim();
+            const issue = String(req.body?.issue || '').trim().slice(0, 4_000);
+            if (!query || !LANGUAGES[fromLang] || !LANGUAGES[toLang] || !correctionSections.has(section) || !issue) {
+                return res.status(400).json({ error:{ message:'A word, language pair, section and explanation are required.' } });
+            }
+            const proposedValue = sanitizeCorrectionValue(req.body?.proposedValue);
+            const createdAt = Date.now();
+            const id = correctionDocumentId(req.user.uid, query, fromLang, toLang, section, createdAt);
+            const dictionaryEntryId = dictionaryDocumentId(query, fromLang, toLang);
+            await correctionsCollection().doc(id).set({
+                uid:req.user.uid,
+                userEmail:req.user.email || '',
+                query,
+                queryLower:query.toLocaleLowerCase(),
+                fromLang,
+                toLang,
+                dictionaryEntryId,
+                section,
+                issue,
+                proposedValue,
+                status:'pending',
+                createdAt,
+                submittedAt:FieldValue.serverTimestamp()
+            });
+            res.status(201).json({ ok:true, id, status:'pending' });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message } });
+        }
+    });
+
+app.get('/api/corrections/mine', requireUser, async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 100, 250);
+    const snapshot = await correctionsCollection().orderBy('createdAt', 'desc').limit(1_000).get();
+    const corrections = snapshot.docs.map(document => ({ id:document.id, ...document.data() }))
+        .filter(item => item.uid === req.user.uid).slice(0, limit);
+    res.json({ corrections });
 });
 
 app.post('/api/translation-events', requireUser, rateLimit({ windowMs:60 * 60_000, max:300, key:req => `translation-events:${req.user.uid}` }), async (req, res) => {
@@ -488,6 +615,109 @@ app.get('/api/admin/metrics', requireUser, requireAdmin, async (_req, res) => {
         jobs:jobs.docs.map(document => ({ id:document.id, ...document.data(), result:undefined })),
         events:events.docs.map(document => ({ id:document.id, ...document.data(), timestamp:timestampMillis(document.data().timestamp) }))
     });
+});
+
+app.get('/api/admin/performance', requireUser, requireAdmin, async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 2_000, 5_000);
+    const snapshot = await db.collection('admin_metrics').doc('events').collection('items')
+        .orderBy('timestamp', 'desc').limit(limit).get();
+    const events = snapshot.docs.map(document => ({ id:document.id, ...document.data() }));
+    res.json({
+        sampleSize:events.length,
+        generatedAt:Date.now(),
+        pricingConfigured:!!(
+            Number(process.env.GEMINI_PRIMARY_INPUT_USD_PER_MILLION || 0)
+            && Number(process.env.GEMINI_PRIMARY_OUTPUT_USD_PER_MILLION || 0)
+        ),
+        ...summarizePerformanceEvents(events)
+    });
+});
+
+app.get('/api/admin/corrections', requireUser, requireAdmin, async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 1_000, 2_000);
+    const snapshot = await correctionsCollection().orderBy('createdAt', 'desc').limit(limit).get();
+    res.json({
+        corrections:snapshot.docs.map(document => ({
+            id:document.id, ...document.data(),
+            submittedAt:timestampMillis(document.data().submittedAt),
+            reviewedAt:timestampMillis(document.data().reviewedAt)
+        }))
+    });
+});
+
+app.patch('/api/admin/corrections/:id', requireUser, requireAdmin, async (req, res) => {
+    const correctionRef = correctionsCollection().doc(req.params.id);
+    const snapshot = await correctionRef.get();
+    if (!snapshot.exists) return res.status(404).json({ error:{ message:'Correction request not found.' } });
+    const correction = snapshot.data();
+    const action = String(req.body?.action || '').toLowerCase();
+    const reviewNote = String(req.body?.reviewNote || '').trim().slice(0, 2_000);
+    if (!['approve', 'reject'].includes(action)) {
+        return res.status(400).json({ error:{ message:'Choose approve or reject.' } });
+    }
+    if (action === 'reject') {
+        await correctionRef.update({
+            status:'rejected', reviewNote, reviewedBy:req.user.uid,
+            reviewedAt:FieldValue.serverTimestamp()
+        });
+        return res.json({ ok:true, status:'rejected' });
+    }
+
+    try {
+        const approvedValue = sanitizeCorrectionValue(
+            Object.prototype.hasOwnProperty.call(req.body || {}, 'approvedValue')
+                ? req.body.approvedValue : correction.proposedValue
+        );
+        if (approvedValue == null || approvedValue === '') {
+            return res.status(400).json({ error:{ message:'An approved replacement value is required.' } });
+        }
+        if (!correctionSections.has(correction.section)) {
+            return res.status(400).json({ error:{ message:'This dictionary section cannot be overridden.' } });
+        }
+        const dictionaryRef = db.doc(`artifacts/${APP_ID}/public/data/global_dictionary/${correction.dictionaryEntryId}`);
+        const dictionarySnapshot = await dictionaryRef.get();
+        if (!dictionarySnapshot.exists) {
+            return res.status(404).json({ error:{ message:'The corresponding global-dictionary entry no longer exists.' } });
+        }
+        const stored = dictionarySnapshot.data();
+        const raw = typeof stored.fullJSON === 'string' ? JSON.parse(stored.fullJSON) : stored.translation;
+        const candidate = { ...raw, [correction.section]:approvedValue };
+        const context = {
+            query:correction.query,
+            fromLang:correction.fromLang,
+            toLang:correction.toLang,
+            definitionsOnly:correction.fromLang === correction.toLang
+        };
+        const normalized = normalizeTranslationResult(candidate, context);
+        const issues = coreQualityIssues(normalized, context);
+        if (issues.length) {
+            return res.status(400).json({
+                error:{ message:`The proposed replacement would make the entry incomplete: ${issues.join(', ')}.` }
+            });
+        }
+        await dictionaryRef.update({
+            fullJSON:JSON.stringify(normalized),
+            schemaVersion:DICTIONARY_SCHEMA_VERSION,
+            modelVersion:DICTIONARY_SCHEMA_VERSION,
+            coreComplete:true,
+            status:stored.contextsComplete ? 'verified' : 'core_ready',
+            adminOverrideSections:FieldValue.arrayUnion(correction.section),
+            overrideCount:FieldValue.increment(1),
+            lastOverrideAt:FieldValue.serverTimestamp(),
+            updatedAt:Date.now()
+        });
+        await correctionRef.update({
+            status:'approved',
+            approvedValue,
+            reviewNote,
+            reviewedBy:req.user.uid,
+            reviewedAt:FieldValue.serverTimestamp(),
+            appliedToDictionary:true
+        });
+        res.json({ ok:true, status:'approved', dictionaryEntryId:correction.dictionaryEntryId });
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message || 'Unable to apply the correction.' } });
+    }
 });
 
 app.get('/api/admin/dictionary', requireUser, requireAdmin, async (req, res) => {

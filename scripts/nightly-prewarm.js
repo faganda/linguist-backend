@@ -148,15 +148,8 @@ async function applyResults(status, candidates) {
         const context = candidates[index].context;
         try {
             const raw = parseGeminiJSON(inline.response);
-            let result = normalizeTranslationResult(raw, context);
-            let issues = coreQualityIssues(result, context);
-            const onlyConjugationIssues = issues.length > 0 && issues.every(issue =>
-                issue.startsWith('incomplete conjugation') || issue === 'missing language-specific conjugations');
-            if (result.isVerb && onlyConjugationIssues) {
-                const completed = await service.completeConjugations(context, result, 'nightly-prewarm');
-                result = completed.result;
-                issues = coreQualityIssues(result, context);
-            }
+            const result = normalizeTranslationResult(raw, context);
+            const issues = coreQualityIssues(result, context);
             if (issues.length) { console.warn(`Skipped ${contextKey(context)}: ${issues.join(', ')}`); rejected += 1; continue; }
             await service.saveCachedResult(context, result, {
                 model:PRIMARY_MODEL, fallbackUsed:false, fallbackReason:'', incrementUse:false
