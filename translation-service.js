@@ -14,7 +14,7 @@ export const USAGE_LEVELS = Object.freeze([
     'fragment', 'proper-name', 'offensive-clipping', 'invalid'
 ]);
 
-export const DICTIONARY_SCHEMA_VERSION = 8;
+export const DICTIONARY_SCHEMA_VERSION = 9;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
 export const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
@@ -69,10 +69,10 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
         },
         isVerb:{ type:'boolean' },
         conjugationGroups:{
-            type:'array', maxItems:10,
+            type:'array', maxItems:24,
             items:{
                 type:'object', additionalProperties:false,
-                properties:{ label:{ type:'string' }, forms:textArray(20), note:{ type:'string' } },
+                properties:{ label:{ type:'string' }, forms:textArray(24), note:{ type:'string' } },
                 required:['label', 'forms', 'note']
             }
         },
@@ -273,13 +273,13 @@ function normalizeConjugations(result) {
     const seen = new Set();
     return groups.map(group => ({
         label:cleanText(group?.label || group?.tense),
-        forms:cleanTextArray(group?.forms, 20),
+        forms:cleanTextArray(group?.forms, 24),
         note:cleanText(group?.note)
     })).filter(group => {
         const key = group.label.toLocaleLowerCase('en');
         if (!key || !group.forms.length || seen.has(key)) return false;
         seen.add(key); return true;
-    }).slice(0, 10);
+    }).slice(0, 24);
 }
 
 function conjugationObject(groups) {
@@ -523,7 +523,13 @@ First decide only what production needs: whether the exact input is genuinely es
 
 Validation fields must be internally consistent. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish that is not valid in any supported language. If existsInRequestedLanguage=false, return every linguistic field empty: no translation, definition, etymology, pronunciation, meaning, context, conjugation, phrase, synonym, family, or minimal pair. The server will enforce this rule again.
 
-For an accepted entry, provide a compact but complete core dictionary result. Put register on every distinct meaning because one entry may mix neutral, informal, slang, technical, or other senses. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section. If the entry is a verb, use conjugationGroups with labels natural to ${fromName}; do not force universal English/French tense labels onto other languages. If it is not a verb, return []. Contexts contain names and meaning indexes only, with empty examples arrays; examples are requested separately. Do not generate quiz distractors.
+For an accepted entry, provide a compact but complete core dictionary result. Put register on every distinct meaning because one entry may mix neutral, informal, slang, technical, or other senses. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
+
+ETYMOLOGY IS ABOUT THE SOURCE ENTRY, NEVER ITS TRANSLATION. Both etymology.sourceLang and etymology.targetLang must describe the origin and historical development of the exact source entry "${context.query}" in ${fromName}; neither field may switch to the origin of a destination-language equivalent. Write sourceLang entirely in ${fromName}. ${definitionsOnly ? 'Leave targetLang empty.' : `Write targetLang entirely in ${toName} as a faithful translation of the same etymological facts.`} When reliable information exists, give two to four concise but informative sentences covering the relevant roots or formation, original sense, route into the language, and later development or expression history. For an expression, explain the expression as a whole rather than etymologising an unrelated translated phrase. If evidence is uncertain or genuinely unavailable, state that explicitly and do not invent a story.
+
+If the entry is a verb, make conjugationGroups a comprehensive practical inventory of the standard modern moods, tenses, aspects and non-finite forms that naturally exist in ${fromName}. Do not omit a standard tense merely to keep the answer short, and do not force universal English/French labels onto another language. Include person or pronoun labels where the language normally uses them. Recognised literary, historical or rare forms may be included only when clearly labelled in note. Keep repeated auxiliary constructions concise but accurate. If the entry is not a verb, return [].
+
+Contexts contain names and meaning indexes only, with empty examples arrays; examples are requested separately. Do not generate quiz distractors.
 
 ${definitionsOnly ? `Source and destination are both ${fromName}. This is definitions-only mode. Keep mainTranslation and all target-language fields empty; never duplicate source content.` : `Translate from ${fromName} to ${toName}. Source fields must be in ${fromName}; target fields must be in ${toName}.`}
 
@@ -533,7 +539,7 @@ Use supported language codes only: ${Object.keys(LANGUAGES).join(', ')}. Return 
         systemInstruction:{ parts:[{ text:system }] },
         generationConfig:{
             responseMimeType:'application/json', responseJsonSchema:CORE_RESPONSE_SCHEMA,
-            maxOutputTokens:8192
+            maxOutputTokens:12288
         }
     };
 }
