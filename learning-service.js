@@ -206,16 +206,29 @@ const cleanVocabulary = value => (Array.isArray(value) ? value : []).slice(0, 12
 })).filter(item => item.word);
 
 export function parseInlineMedia(value, allowedPrefixes) {
-    const match = String(value || '').match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/);
-    if (!match || !allowedPrefixes.some(prefix => match[1].toLowerCase().startsWith(prefix))) {
+    const match = String(value || '').match(/^data:([^,]+),([\s\S]*)$/i);
+    const metadata = match?.[1]?.split(';').map(item => item.trim()).filter(Boolean) || [];
+    const rawMimeType = String(metadata.shift() || '').toLowerCase();
+    const isBase64 = metadata.some(item => item.toLowerCase() === 'base64');
+    const supported = allowedPrefixes.some(prefix => rawMimeType.startsWith(prefix));
+    if (!match || !rawMimeType || !isBase64 || !supported) {
         throw Object.assign(new Error('The uploaded media format is not supported.'), { status:400 });
     }
     const data = match[2].replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+        throw Object.assign(new Error('The uploaded media format is not supported.'), { status:400 });
+    }
     const size = Math.floor(data.length * 0.75);
     if (!data || size > 8_000_000) {
         throw Object.assign(new Error('The uploaded media must be smaller than 8 MB.'), { status:413 });
     }
-    return { mimeType:match[1].toLowerCase(), data };
+    const mimeAliases = {
+        'audio/x-m4a':'audio/mp4',
+        'audio/mp4a-latm':'audio/mp4',
+        'audio/x-wav':'audio/wav',
+        'audio/wave':'audio/wav'
+    };
+    return { mimeType:mimeAliases[rawMimeType] || rawMimeType, data };
 }
 
 function request(system, userText, schema, { parts = [], maxOutputTokens = 4_096 } = {}) {
