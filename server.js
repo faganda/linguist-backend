@@ -13,7 +13,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '3.5.1';
+const BACKEND_VERSION = '3.5.2';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';

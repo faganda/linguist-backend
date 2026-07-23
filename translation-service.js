@@ -377,6 +377,43 @@ const cleanTextArray = (value, limit = 20) => Array.isArray(value)
 // lexical-list de-duplication used by synonyms and translations.
 const cleanConjugationForms = (value, limit = 32) => Array.isArray(value)
     ? value.map(cleanText).filter(Boolean).slice(0, limit) : [];
+const GRAMMATICAL_LABEL_MARKERS = Object.freeze([
+    'noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition', 'conjunction',
+    'interjection', 'determiner', 'article', 'numeral', 'particle', 'auxiliary',
+    'proper noun', 'phrasal verb', 'nom', 'verbe', 'adjectif', 'adverbe', 'pronom',
+    'préposition', 'conjonction', 'déterminant', 'sustantivo', 'verbo', 'adjetivo',
+    'adverbio', 'pronombre', 'preposición', 'conjunción', 'substantiv', 'nomen',
+    'zeitwort', 'adjektiv', 'adverb', 'nome', 'verbo', 'aggettivo', 'substantivo'
+]);
+const escapeRegularExpression = value => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+
+export function normalizeMeaningLabel(value, partOfSpeech = '') {
+    const original = cleanText(value).replace(/_+/gu, ' ').replace(/\s+/gu, ' ');
+    if (!original) return '';
+    const markers = [...new Set([
+        ...GRAMMATICAL_LABEL_MARKERS,
+        ...String(partOfSpeech || '').split(/[·,/&]+/u).map(cleanText).filter(Boolean)
+    ].map(marker => marker.toLocaleLowerCase('en')))]
+        .sort((left, right) => right.length - left.length);
+    const isGrammaticalDescription = valueToCheck => {
+        const normalized = cleanText(valueToCheck).toLocaleLowerCase('en');
+        return markers.some(marker => normalized === marker
+            || normalized.startsWith(`${marker} `)
+            || normalized.endsWith(` ${marker}`));
+    };
+
+    let label = original.replace(/\s*[\[(]([^)\]]+)[)\]]\s*$/u, (match, inner) =>
+        isGrammaticalDescription(inner) ? '' : match).trim();
+    for (const marker of markers) {
+        const escaped = escapeRegularExpression(marker);
+        label = label
+            .replace(new RegExp(`^${escaped}(?:\\s*[:–—|/-]\\s*|\\s+)`, 'iu'), '')
+            .replace(new RegExp(`(?:\\s*[:–—|/-]\\s*|\\s+)${escaped}$`, 'iu'), '')
+            .trim();
+    }
+    if (!label) return original;
+    return label.charAt(0).toLocaleUpperCase() + label.slice(1);
+}
 const cleanCode = value => {
     const code = String(value || '').trim().toUpperCase();
     return LANGUAGES[code] ? code : '';
@@ -699,8 +736,8 @@ export function normalizeTranslationResult(rawResult, context) {
         synonyms:normalizeBilingual(result.synonyms),
         similarPhrases:normalizeBilingual(result.similarPhrases || result.relatedPhrases),
         meanings:(Array.isArray(result.meanings) ? result.meanings : []).map(meaning => ({
-            label:cleanText(meaning?.label),
             partOfSpeech:cleanText(meaning?.partOfSpeech),
+            label:normalizeMeaningLabel(meaning?.label, meaning?.partOfSpeech),
             // A production meaning must carry its own register. Do not silently
             // inherit the entry-level compatibility label, because mixed-register
             // words such as "awesome", "lit" and "cheers" need distinct labels.
@@ -820,7 +857,7 @@ export function coreQualityIssues(result, context) {
         issues.push('invalid related-phrases section');
     }
     if (!Array.isArray(result.meanings) || !result.meanings.length
-        || result.meanings.some(meaning => !hasText(meaning.partOfSpeech)
+        || result.meanings.some(meaning => !hasText(meaning.label) || !hasText(meaning.partOfSpeech)
             || !hasText(meaning.sourceDefinition) || !REGISTER_VALUES.includes(meaning.register)
             || (!definitionsOnly && (!hasText(meaning.targetDefinition) || !meaning.translations?.some(hasText))))) {
         issues.push('missing or incomplete meanings');
@@ -943,7 +980,7 @@ First decide only what production needs: whether the exact input is genuinely es
 
 Validation fields must be internally consistent. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish that is not valid in any supported language. If existsInRequestedLanguage=false, return every linguistic field empty: no translation, definition, etymology, pronunciation, meaning, context, conjugation, phrase, synonym, family, or minimal pair. The server will enforce this rule again.
 
-For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must list every established grammatical class represented by the returned meanings, not merely the first one. Put an exact partOfSpeech and register on every distinct meaning because one written entry may have noun, verb, adjective or other senses and may mix neutral, informal, slang, technical or other registers. Split materially different grammatical uses into separate meanings. For example, English "approach" must include its verb senses and its noun senses rather than being classified only as a verb. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section. Synonyms, similar phrases and collocations must always retain their bilingual containers, but their arrays may be empty when no genuine item exists. Never invent a synonym or phrase merely to satisfy a section.
+For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must list every established grammatical class represented by the returned meanings, not merely the first one. Put an exact partOfSpeech and register on every distinct meaning because one written entry may have noun, verb, adjective or other senses and may mix neutral, informal, slang, technical or other registers. Split materially different grammatical uses into separate meanings. For example, English "approach" must include its verb senses and its noun senses rather than being classified only as a verb. Every meaning.label must be a short, natural, human-readable semantic or usage title in ${fromName}; never put its grammatical classification in the label because partOfSpeech already carries it. Do not use snake_case, prefixes such as "noun_" or "verb_", suffixes such as "_noun", or parenthetical labels such as "(verb)". Use consistent titles such as "Movement toward something", "Method or strategy", "Physical structure", "Connection or linking", "General state", and "Technical/computing". formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section. Synonyms, similar phrases and collocations must always retain their bilingual containers, but their arrays may be empty when no genuine item exists. Never invent a synonym or phrase merely to satisfy a section.
 
 ETYMOLOGY IS ABOUT THE SOURCE ENTRY, NEVER ITS TRANSLATION. Both etymology.sourceLang and etymology.targetLang must describe the origin and historical development of the exact source entry "${context.query}" in ${fromName}; neither field may switch to the origin of a destination-language equivalent. Write sourceLang entirely in ${fromName}. ${definitionsOnly ? 'Leave targetLang empty.' : `Write targetLang entirely in ${toName} as a faithful translation of the same etymological facts.`} When reliable information exists, give two to four concise but informative sentences covering the relevant roots or formation, original sense, route into the language, and later development or expression history. For an expression, explain the expression as a whole rather than etymologising an unrelated translated phrase. If evidence is uncertain or genuinely unavailable, state that explicitly and do not invent a story.
 
