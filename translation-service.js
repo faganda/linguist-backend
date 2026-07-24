@@ -325,6 +325,62 @@ const cleanCode = value => {
 };
 const boundedConfidence = value => Math.max(0, Math.min(1, Number.isFinite(Number(value)) ? Number(value) : 0.5));
 const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
+const PRONUNCIATION_LANGUAGE_LABELS = Object.freeze(Object.fromEntries([
+    ...Object.keys(LANGUAGES).map(code => [code.toLocaleLowerCase('en'), code]),
+    ...Object.entries(LANGUAGES).map(([code, name]) => [name.toLocaleLowerCase('en'), code])
+]));
+const PRONUNCIATION_LANGUAGE_PATTERN = Object.keys(PRONUNCIATION_LANGUAGE_LABELS)
+    .sort((left, right) => right.length - left.length)
+    .map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|');
+
+/**
+ * Keep only the source entry's pronunciation. Older cached records may contain
+ * bilingual values such as "/.../ (EN), /.../ (FR)". Selecting by the explicit
+ * language label lets those entries render correctly without an unnecessary
+ * model request. If labels are present but none identifies the requested source,
+ * return an empty value so the normal quality/repair path can regenerate it.
+ */
+export function sourceOnlyPronunciation(value, sourceLanguage) {
+    const text = cleanText(value).replace(/\s+/gu, ' ');
+    const source = cleanCode(sourceLanguage);
+    if (!text || !source) return text;
+
+    const labelled = [];
+    const trailingLabel = new RegExp(
+        `((?:\\/[^/\\r\\n]+\\/|\\[[^\\]\\r\\n]+\\]|[^,;|]+?))\\s*\\(\\s*(${PRONUNCIATION_LANGUAGE_PATTERN})\\s*\\)`,
+        'giu'
+    );
+    for (const match of text.matchAll(trailingLabel)) {
+        labelled.push({
+            pronunciation:cleanText(match[1]).replace(/^[,;|\s]+|[,;|\s]+$/gu, ''),
+            language:PRONUNCIATION_LANGUAGE_LABELS[String(match[2]).toLocaleLowerCase('en')]
+        });
+    }
+
+    const leadingLabel = new RegExp(
+        `(?:^|[,;|])\\s*(${PRONUNCIATION_LANGUAGE_PATTERN})\\s*[:–—-]\\s*((?:\\/[^/\\r\\n]+\\/|\\[[^\\]\\r\\n]+\\]|[^,;|]+))`,
+        'giu'
+    );
+    for (const match of text.matchAll(leadingLabel)) {
+        labelled.push({
+            pronunciation:cleanText(match[2]).replace(/^[,;|\s]+|[,;|\s]+$/gu, ''),
+            language:PRONUNCIATION_LANGUAGE_LABELS[String(match[1]).toLocaleLowerCase('en')]
+        });
+    }
+
+    if (labelled.length) {
+        return labelled.find(item => item.language === source)?.pronunciation || '';
+    }
+
+    // A single source-language label is harmless but should not be displayed.
+    const sourceLabels = [source, LANGUAGES[source]]
+        .map(label => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    return text
+        .replace(new RegExp(`\\s*\\(\\s*(?:${sourceLabels})\\s*\\)\\s*$`, 'iu'), '')
+        .replace(new RegExp(`^\\s*(?:${sourceLabels})\\s*[:–—-]\\s*`, 'iu'), '')
+        .trim();
+}
 
 export function normalizeDictionaryQuery(value) {
     return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
@@ -560,7 +616,7 @@ export function normalizePreviewResult(rawResult, context) {
         partOfSpeech:normalizePartOfSpeech(result.partOfSpeech, context.query),
         formality,
         mainTranslation:cleanTextArray(result.mainTranslation, 4),
-        pronunciationGuide:cleanText(result.pronunciationGuide),
+        pronunciationGuide:sourceOnlyPronunciation(result.pronunciationGuide, context.fromLang),
         previewMeaning:{
             partOfSpeech:normalizePartOfSpeech(
                 meaning.partOfSpeech || result.partOfSpeech,
@@ -666,7 +722,7 @@ export function normalizeTranslationResult(rawResult, context) {
         formality,
         learningMetadata:normalizeLearningMetadata(result.learningMetadata, context.definitionsOnly === true),
         mainTranslation:cleanTextArray(result.mainTranslation, 8),
-        pronunciationGuide:cleanText(result.pronunciationGuide),
+        pronunciationGuide:sourceOnlyPronunciation(result.pronunciationGuide, context.fromLang),
         etymology:{ sourceLang:cleanText(result.etymology?.sourceLang), targetLang:cleanText(result.etymology?.targetLang) },
         isVerb,
         conjugationGroups,
@@ -881,7 +937,7 @@ First decide whether the exact input is genuinely established in requested sourc
 
 Validation fields must be internally consistent. validLanguages is supporting evidence and need not be exhaustive. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish. If existsInRequestedLanguage=false, leave partOfSpeech, formality, mainTranslation, pronunciationGuide and every previewMeaning field empty. Do not translate a source-language mismatch.
 
-For an accepted entry, return every established part of speech in partOfSpeech, one concise pronunciation guide, ${definitionsOnly ? 'no translation' : `one to four useful ${toName} translations`}, and one concise source-language definition for the most common sense. Use concise English grammatical labels. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. ${definitionsOnly ? 'Keep targetDefinition empty.' : `Give a faithful ${toName} targetDefinition.`} Include the exact part of speech and register for that meaning.
+For an accepted entry, return every established part of speech in partOfSpeech, one concise pronunciation guide, ${definitionsOnly ? 'no translation' : `one to four useful ${toName} translations`}, and one concise source-language definition for the most common sense. pronunciationGuide must contain only the pronunciation of the exact source entry in ${fromName}; never include the destination-language pronunciation, a bilingual pronunciation pair, or language labels such as "(EN)" and "(FR)". Use concise English grammatical labels. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. ${definitionsOnly ? 'Keep targetDefinition empty.' : `Give a faithful ${toName} targetDefinition.`} Include the exact part of speech and register for that meaning.
 
 Write sourceDefinition in ${fromName}. ${definitionsOnly ? 'Keep mainTranslation and targetDefinition empty.' : `Write mainTranslation and targetDefinition in ${toName}.`} Use only these language codes: ${Object.keys(LANGUAGES).join(', ')}. Return strict JSON matching the schema.${repairInstruction}`;
     return {
@@ -909,6 +965,8 @@ First decide only what production needs: whether the exact input is genuinely es
 Validation fields must be internally consistent. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish that is not valid in any supported language. If existsInRequestedLanguage=false, return every linguistic field empty: no translation, definition, etymology, pronunciation, meaning, context, conjugation, phrase, synonym, family, or minimal pair. The server will enforce this rule again.
 
 For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must classify the exact whole input using concise English grammatical labels so the interface remains consistent. For a multiword entry, use a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Adjective phrase, Idiomatic expression, Clause or Sentence; never reduce "escape valve" to the bare single-word label "Noun". When established senses span word classes, list all of them, for example "Noun · Verb". Set isVerb=true whenever at least one established sense is verbal, even if the entry is also a noun or adjective.
+
+pronunciationGuide must contain one concise pronunciation of the exact source entry in ${fromName} only. Never add a destination-language pronunciation, never return a bilingual pronunciation pair, and never append language labels such as "(EN)" or "(FR)".
 
     Put an exact English partOfSpeech and a register on every distinct meaning because one entry may mix grammatical classes and registers. Classify the individual sense itself (for example Noun, Noun phrase, Verb, Adjective, Adverb, Phrasal verb or Idiomatic expression); do not copy the entry-level multi-class list into every meaning. Each meaning label must remain a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
 
