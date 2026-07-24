@@ -1193,6 +1193,28 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     const previewFallbackTimeoutMs = Math.max(2_000, Number(process.env.GEMINI_PREVIEW_FALLBACK_TIMEOUT_MS || Math.min(fallbackTimeoutMs, 12_000)));
     const cacheReadTimeoutMs = Math.max(1_000, Number(process.env.DICTIONARY_READ_TIMEOUT_MS || 4_000));
     const cacheWriteTimeoutMs = Math.max(1_000, Number(process.env.DICTIONARY_WRITE_TIMEOUT_MS || 5_000));
+        const l1CoreCache = new Map();
+    const l1PreviewCache = new Map();
+    const l1ContextsCache = new Map();
+    const l1DistractorCache = new Map();
+    const MAX_L1_ENTRIES = 1000;
+
+    function getL1(cache, key) {
+        const entry = cache.get(key);
+        if (!entry) return null;
+        if (Date.now() > entry.expiresAt) {
+            cache.delete(key);
+            return null;
+        }
+        cache.delete(key);
+        cache.set(key, entry);
+        return entry.value;
+    }
+
+    function setL1(cache, key, value, ttlMs) {
+        if (cache.size >= MAX_L1_ENTRIES) cache.delete(cache.keys().next().value);
+        cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+    }
     const previewFlights = new Map();
     const coreFlights = new Map();
     const exampleFlights = new Map();
@@ -1480,6 +1502,13 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     async function getPreview(context, uid) {
         const started = performance.now();
         const ref = dictionaryRef(context);
+        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
+        const l1Hit = getL1(l1PreviewCache, flightKey);
+        if (l1Hit) {
+            const cacheLookupMs = Math.round(performance.now() - started);
+            recordUsage(uid, 'translation_preview_cache_hit', { cacheStatus:'fresh_l1', cacheLookupMs, latencyMs:cacheLookupMs, fromLang:context.fromLang, toLang:context.toLang }).catch(() => {});
+            return { preview: l1Hit, meta:{ phase:'preview', source:'in_memory', cacheStatus:'fresh_l1', previewSchemaVersion:PREVIEW_SCHEMA_VERSION, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+        }
         const snapshot = await readDictionary(ref, 'Preview-cache lookup');
         const cacheLookupMs = Math.round(performance.now() - started);
         const now = Date.now();
@@ -1536,10 +1565,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             };
         }
 
-        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
         const generated = await singleFlight(previewFlights, flightKey, () => generatePreview(context, uid));
         generated.meta.cacheLookupMs = cacheLookupMs;
         generated.meta.latencyMs = Math.round(performance.now() - started);
+        if (generated.preview && generated.preview.wordExists !== false) setL1(l1PreviewCache, flightKey, generated.preview, freshTtlMs);
         return generated;
     }
 
@@ -1682,6 +1711,17 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     async function getCore(context, uid, { forceRefresh = false, touch = true } = {}) {
         const started = performance.now();
         const ref = dictionaryRef(context);
+        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
+        if (!forceRefresh) {
+            const l1Hit = getL1(l1CoreCache, flightKey);
+            if (l1Hit) {
+                const cacheLookupMs = Math.round(performance.now() - started);
+                if (touch) {
+                    recordUsage(uid, 'translation_cache_hit', { cacheStatus:'fresh_l1', cacheLookupMs, latencyMs:cacheLookupMs, fromLang:context.fromLang, toLang:context.toLang }).catch(() => {});
+                }
+                return { result: l1Hit, meta:{ source:'in_memory', cacheStatus:'fresh_l1', schemaVersion:DICTIONARY_SCHEMA_VERSION, contextsReady:contextsAreComplete(l1Hit, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+            }
+        }
         const snapshot = await readDictionary(ref);
         const cacheLookupMs = Math.round(performance.now() - started);
         const cached = parseStored(snapshot, context);
@@ -1729,10 +1769,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:needsSchemaRefresh ? 'schema_upgrade' : 'stale', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:true, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
         }
 
-        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
         const generated = await singleFlight(coreFlights, flightKey, () => generateCore(context, uid, cached?.result));
         generated.meta.cacheLookupMs = cacheLookupMs;
         generated.meta.latencyMs = Math.round(performance.now() - started);
+        if (generated.preview && generated.preview.wordExists !== false) setL1(l1PreviewCache, flightKey, generated.preview, freshTtlMs);
         return generated;
     }
 
@@ -1776,6 +1816,12 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function getContexts(context, uid) {
         const started = performance.now();
+        const flightKey = `${dictionaryIdentity(context.query, context.fromLang, context.toLang)}|contexts`;
+        const l1Hit = getL1(l1ContextsCache, flightKey);
+        if (l1Hit) {
+            const cacheLookupMs = Math.round(performance.now() - started);
+            return { contexts: l1Hit, meta: { source: 'in_memory', cacheStatus: 'fresh_l1', contextsReady: true, latencyMs: cacheLookupMs, fallbackUsed: false, modelCalls: [] } };
+        }
         const coreResponse = await getCore(context, uid, { touch:false });
         const coreResult = coreResponse.result;
         if (!coreResult?.sourceLanguageValidation?.existsInRequestedLanguage || !coreResult.wordExists) {
@@ -1784,8 +1830,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         if (contextsAreComplete(coreResult, context)) {
             return { contexts:coreResult.contexts, meta:{ source:'global_dictionary', cacheStatus:'fresh', contextsReady:true, latencyMs:Math.round(performance.now() - started), fallbackUsed:false, modelCalls:[] } };
         }
-        const key = `${dictionaryIdentity(context.query, context.fromLang, context.toLang)}|contexts`;
-        return singleFlight(exampleFlights, key, async () => {
+        
+        return singleFlight(exampleFlights, flightKey, async () => {
             const count = examplesPerContext(coreResult.contexts.length);
             const generated = await Promise.all(coreResult.contexts.map(item => generateContextExamples(context, coreResult, item, count, uid)));
             const completed = { ...coreResult, contexts:generated.map(item => item.context) };
@@ -1801,19 +1847,23 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 compatibilityMode:call.compatibilityMode, compatibilityRetries:call.compatibilityRetries,
                 ...call.tokens
             }));
-            return {
+            const res = {
                 contexts:saved.contexts,
                 meta:{ source:'generated', cacheStatus:'miss', contextsReady:true,
                     fallbackUsed:generated.some(item => item.fallbackUsed),
                     fallbackReason:generated.filter(item => item.fallbackReason).map(item => item.fallbackReason).join(','),
                     latencyMs:Math.round(performance.now() - started), modelCalls:calls }
             };
+            setL1(l1ContextsCache, flightKey, saved.contexts, freshTtlMs);
+            return res;
         });
     }
 
     async function getDistractors(context, uid) {
         const correctKey = normalizeDictionaryQuery(context.correct);
         const key = crypto.createHash('sha256').update(JSON.stringify({ ...context, correct:correctKey })).digest('hex');
+        const l1Hit = getL1(l1DistractorCache, key);
+        if (l1Hit) return l1Hit;
         return singleFlight(distractorFlights, key, async () => {
             let response;
             try {
@@ -1834,11 +1884,13 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             const distractors = cleanTextArray(response.result?.distractors, 4)
                 .filter(value => normalizeDictionaryQuery(value) !== correctKey).slice(0, context.count || 4);
             if (distractors.length < Math.min(2, context.count || 4)) throw Object.assign(new Error('Not enough realistic distractors were generated.'), { status:502 });
-            return { distractors, meta:{
+            const res = { distractors, meta:{
                 model:response.model, thinkingLevel:response.thinkingLevel, latencyMs:response.latencyMs,
                 compatibilityMode:response.compatibilityMode, compatibilityRetries:response.compatibilityRetries,
                 ...response.tokens
             } };
+            setL1(l1DistractorCache, key, res, freshTtlMs);
+            return res;
         });
     }
 
