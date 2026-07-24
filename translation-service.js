@@ -18,7 +18,7 @@ export const CEFR_LEVELS = Object.freeze(['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'U
 export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less common', 'Rare', 'Specialized']);
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 
-export const DICTIONARY_SCHEMA_VERSION = 13;
+export const DICTIONARY_SCHEMA_VERSION = 14;
 export const PREVIEW_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
@@ -199,10 +199,11 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
             items:{
                 type:'object', additionalProperties:false,
                 properties:{
-                    label:{ type:'string' }, register:{ type:'string', enum:REGISTER_VALUES },
+                    label:{ type:'string' }, partOfSpeech:{ type:'string' },
+                    register:{ type:'string', enum:REGISTER_VALUES },
                     sourceDefinition:{ type:'string' }, targetDefinition:{ type:'string' }, translations:textArray(8)
                 },
-                required:['label', 'register', 'sourceDefinition', 'targetDefinition', 'translations']
+                required:['label', 'partOfSpeech', 'register', 'sourceDefinition', 'targetDefinition', 'translations']
             }
         },
         collocations:bilingualLists(12),
@@ -667,6 +668,9 @@ export function normalizeTranslationResult(rawResult, context) {
         similarPhrases:normalizeBilingual(result.similarPhrases || result.relatedPhrases),
         meanings:(Array.isArray(result.meanings) ? result.meanings : []).map((meaning, index) => ({
             label:normalizeMeaningLabel(meaning?.label, index),
+            // Keep each sense's grammatical classification separate from its
+            // semantic title and from the entry-level list of all classes.
+            partOfSpeech:normalizePartOfSpeech(meaning?.partOfSpeech, context.query),
             // A production meaning must carry its own register. Do not silently
             // inherit the entry-level compatibility label, because mixed-register
             // words such as "awesome", "lit" and "cheers" need distinct labels.
@@ -776,7 +780,8 @@ export function coreQualityIssues(result, context) {
     const targetRelated = [...(result.similarPhrases?.targetLang || []), ...(result.collocations?.targetLang || [])];
     if (!sourceRelated.some(hasText) || (!definitionsOnly && !targetRelated.some(hasText))) issues.push('missing related phrases or collocations');
     if (!Array.isArray(result.meanings) || !result.meanings.length
-        || result.meanings.some(meaning => !hasText(meaning.sourceDefinition) || !REGISTER_VALUES.includes(meaning.register)
+        || result.meanings.some(meaning => !hasText(meaning.partOfSpeech)
+            || !hasText(meaning.sourceDefinition) || !REGISTER_VALUES.includes(meaning.register)
             || (!definitionsOnly && (!hasText(meaning.targetDefinition) || !meaning.translations?.some(hasText))))) {
         issues.push('missing or incomplete meanings');
     }
@@ -890,7 +895,7 @@ Validation fields must be internally consistent. If validLanguages is nonempty, 
 
 For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must classify the exact whole input using concise English grammatical labels so the interface remains consistent. For a multiword entry, use a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Adjective phrase, Idiomatic expression, Clause or Sentence; never reduce "escape valve" to the bare single-word label "Noun". When established senses span word classes, list all of them, for example "Noun · Verb". Set isVerb=true whenever at least one established sense is verbal, even if the entry is also a noun or adjective.
 
-Put register on every distinct meaning because one entry may mix neutral, informal, slang, technical, or other senses. Each meaning label must be a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
+    Put an exact English partOfSpeech and a register on every distinct meaning because one entry may mix grammatical classes and registers. Classify the individual sense itself (for example Noun, Noun phrase, Verb, Adjective, Adverb, Phrasal verb or Idiomatic expression); do not copy the entry-level multi-class list into every meaning. Each meaning label must remain a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
 
 LEARNING METADATA: estimate the entry's practical CEFR vocabulary level as A1, A2, B1, B2, C1 or C2; use Unclassified for proper names, specialist terminology or expressions that cannot responsibly be mapped. Classify frequency as Very common, Common, Less common, Rare or Specialized, and modality as Spoken, Written or Both. sourceNote must briefly explain the level, frequency and typical use in ${fromName}. ${definitionsOnly ? 'Leave targetNote empty.' : `targetNote must faithfully explain the same learning guidance in ${toName}.`} Treat these as learner guidance, not an official certification claim.
 
@@ -996,7 +1001,7 @@ ${context.definitionsOnly ? `Write original and explanation in ${fromName}. Keep
 
 Do not create distractors. Return strict JSON matching the schema.${repairIssues.length ? ` Repair these prior defects: ${repairIssues.join('; ')}.` : ''}`;
     return {
-        contents:[{ role:'user', parts:[{ text:`Entry: ${context.query}\nContext: ${contextItem.contextName}\nMeaning: ${meaning.sourceDefinition || contextItem.contextName}\nRegister: ${meaning.register || coreResult.formality}` }] }],
+        contents:[{ role:'user', parts:[{ text:`Entry: ${context.query}\nContext: ${contextItem.contextName}\nMeaning: ${meaning.sourceDefinition || contextItem.contextName}\nPart of speech: ${meaning.partOfSpeech || coreResult.partOfSpeech}\nRegister: ${meaning.register || coreResult.formality}` }] }],
         systemInstruction:{ parts:[{ text:system }] },
         generationConfig:{ responseMimeType:'application/json', responseJsonSchema:EXAMPLES_RESPONSE_SCHEMA, maxOutputTokens:8192 }
     };
@@ -1689,7 +1694,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         ]);
         // Learning metadata was introduced in schema v12. A structurally sound older
         // non-verb may still render immediately while its background refresh upgrades
-        // it. Missing schema-v13 conjugation coverage remains blocking for verbs.
+        // it. Missing schema-v13 conjugation coverage and schema-v14 per-meaning
+        // grammatical classifications remain blocking.
         const cacheBlockingIssues = needsSchemaRefresh
             ? cachedIssues.filter(issue => !upgradeOnlyIssues.has(issue))
             : cachedIssues;
