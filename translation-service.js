@@ -18,7 +18,7 @@ export const CEFR_LEVELS = Object.freeze(['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'U
 export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less common', 'Rare', 'Specialized']);
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 
-export const DICTIONARY_SCHEMA_VERSION = 14;
+export const DICTIONARY_SCHEMA_VERSION = 15;
 export const PREVIEW_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
@@ -30,8 +30,9 @@ const NON_QUALIFYING_USAGE = new Set(['rare', 'archaic', 'abbreviation', 'fragme
 
 // These machine-readable keys are never displayed. They let the backend verify
 // that a model covered the source language's own verb system instead of merely
-// returning two or three familiar tenses. Related keys may share one displayed
-// group when that is natural for the language.
+// returning two or three familiar tenses. Schema 15 requires one user-facing
+// tense/form per group so broad headings cannot hide several paradigms inside
+// an unreadable combined block.
 export const CONJUGATION_COVERAGE = Object.freeze({
     EN:Object.freeze([
         'present_simple', 'past_simple', 'future_simple',
@@ -186,7 +187,7 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
                 type:'object', additionalProperties:false,
                 properties:{
                     label:{ type:'string' }, forms:textArray(32), note:{ type:'string' },
-                    coverageKeys:textArray(8)
+                    coverageKeys:textArray(1)
                 },
                 required:['label', 'forms', 'note', 'coverageKeys']
             }
@@ -451,7 +452,7 @@ export function isGenuinelyAmbiguous(result) {
     return validation.mixedLanguage === true || (validation.ambiguous === true && boundedConfidence(validation.confidence) < 0.9);
 }
 
-function normalizeConjugations(result) {
+function normalizeConjugations(result, sourceLanguage) {
     if (result?.isVerb !== true) return [];
     const groups = Array.isArray(result.conjugationGroups)
         ? result.conjugationGroups
@@ -460,7 +461,7 @@ function normalizeConjugations(result) {
             : result.conjugations && typeof result.conjugations === 'object'
                 ? Object.entries(result.conjugations).map(([label, forms]) => ({ label, forms, note:'' })) : [];
     const seen = new Set();
-    return groups.map(group => ({
+    const normalized = groups.map(group => ({
         label:cleanText(group?.label || group?.tense),
         forms:cleanTextArray(group?.forms, 32),
         note:cleanText(group?.note),
@@ -470,6 +471,13 @@ function normalizeConjugations(result) {
         if (!key || !group.forms.length || seen.has(key)) return false;
         seen.add(key); return true;
     }).slice(0, 32);
+    const order = requiredConjugationCoverage(sourceLanguage);
+    const rank = new Map(order.map((coverageKey, index) => [coverageKey, index]));
+    return normalized.sort((left, right) => {
+        const leftRank = rank.get(left.coverageKeys[0]) ?? Number.MAX_SAFE_INTEGER;
+        const rightRank = rank.get(right.coverageKeys[0]) ?? Number.MAX_SAFE_INTEGER;
+        return leftRank - rightRank;
+    });
 }
 
 function conjugationObject(groups) {
@@ -646,7 +654,7 @@ export function normalizeTranslationResult(rawResult, context) {
     const formality = normalizeRegister(result.formality);
     const partOfSpeech = normalizePartOfSpeech(result.partOfSpeech, context.query);
     const isVerb = result.isVerb === true || /\bverb\b/iu.test(partOfSpeech);
-    const conjugationGroups = normalizeConjugations({ ...result, isVerb });
+    const conjugationGroups = normalizeConjugations({ ...result, isVerb }, context.fromLang);
     const normalized = {
         detectedSourceLang:cleanCode(result.detectedSourceLang) || requested,
         sourceLanguageValidation:validation,
@@ -741,9 +749,16 @@ export function conjugationCoverageIssues(result, context) {
     const groups = Array.isArray(result.conjugationGroups) ? result.conjugationGroups : [];
     if (!groups.length) return ['missing language-specific conjugations'];
     const required = requiredConjugationCoverage(context.fromLang);
+    if (groups.some(group => !Array.isArray(group?.coverageKeys) || group.coverageKeys.length !== 1)) {
+        return ['conjugation entries must each represent one tense or form'];
+    }
     const covered = new Set(groups.flatMap(group => cleanTextArray(group?.coverageKeys, 8)));
     const missing = required.filter(key => !covered.has(key));
     if (missing.length) return [`incomplete conjugation coverage: ${missing.join(', ')}`];
+    const duplicates = required.filter(key =>
+        groups.filter(group => cleanTextArray(group?.coverageKeys, 8).includes(key)).length > 1
+    );
+    if (duplicates.length) return [`duplicate conjugation coverage: ${duplicates.join(', ')}`];
     return [];
 }
 
@@ -862,7 +877,7 @@ export function buildPreviewRequest(context, { repairSource = null } = {}) {
         : '';
     const system = `You are Qelumi's fast multilingual dictionary preview engine. Analyse the exact input, never a corrected substitute. Return only the small preview requested by the schema; do not generate etymology, conjugations, synonyms, related phrases, regional variants, word families, contexts or examples.
 
-First decide whether the exact input is genuinely established in requested source ${fromName} (${context.fromLang}). Grammatical sentences, established loanwords, expressions, specialised terms, and well-established fictional or cultural proper names qualify. Language origin is not language membership. Shared established words such as apocalypse and saboteur qualify in English and French. "backend" is established specialised French as well as English. The offensive English clipping "tard" does not qualify as the ordinary English entry; French "tard" does.
+First decide whether the exact input is genuinely established in requested source ${fromName} (${context.fromLang}). Grammatical sentences, established loanwords, expressions, specialised terms, and well-established fictional or cultural proper names qualify. Language origin is not language membership. Shared established words such as apocalypse and saboteur qualify in English and French. "backend" is established specialised French as well as English. The offensive English clipping "tard" does not qualify as the ordinary English entry; French "tard" does. If the input does not belong to the requested source, identify its most likely language from every supported language, even when that language is neither the requested source nor the current destination.
 
 Validation fields must be internally consistent. validLanguages is supporting evidence and need not be exhaustive. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish. If existsInRequestedLanguage=false, leave partOfSpeech, formality, mainTranslation, pronunciationGuide and every previewMeaning field empty. Do not translate a source-language mismatch.
 
@@ -889,7 +904,7 @@ export function buildCoreRequest(context, { repairSource = null } = {}) {
         ? `\nRepair the supplied draft. Correct these production-gate issues: ${repairSource.issues.join('; ')}. Do not repeat the defects.\nDraft JSON:\n${JSON.stringify(repairSource.result)}` : '';
     const system = `You are Qelumi's conservative multilingual dictionary engine. Analyse the exact input, never a corrected substitute.
 
-First decide only what production needs: whether the exact input is genuinely established in requested source ${fromName} (${context.fromLang}); the most likely alternative language if it is not; confidence; and whether the input is genuinely ambiguous or mixed-language. validLanguages is supporting evidence only and need not be exhaustive. A grammatical sentence, established loanword, established expression, and established specialised term qualify. Language origin is not language membership. Shared established words such as apocalypse and saboteur qualify in both English and French. "backend" is also an established French technical borrowing and must be accepted as specialised French when FR is requested, with borrowingNote explaining its English origin. The offensive English clipping "tard" does not qualify as the ordinary English entry; French "tard" does.
+First decide only what production needs: whether the exact input is genuinely established in requested source ${fromName} (${context.fromLang}); the most likely alternative language if it is not; confidence; and whether the input is genuinely ambiguous or mixed-language. Search across every supported language when identifying the most likely language; it may be neither the requested source nor the current destination. validLanguages is supporting evidence only and need not be exhaustive. A grammatical sentence, established loanword, established expression, and established specialised term qualify. Language origin is not language membership. Shared established words such as apocalypse and saboteur qualify in both English and French. "backend" is also an established French technical borrowing and must be accepted as specialised French when FR is requested, with borrowingNote explaining its English origin. The offensive English clipping "tard" does not qualify as the ordinary English entry; French "tard" does.
 
 Validation fields must be internally consistent. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish that is not valid in any supported language. If existsInRequestedLanguage=false, return every linguistic field empty: no translation, definition, etymology, pronunciation, meaning, context, conjugation, phrase, synonym, family, or minimal pair. The server will enforce this rule again.
 
@@ -901,11 +916,11 @@ LEARNING METADATA: estimate the entry's practical CEFR vocabulary level as A1, A
 
 ETYMOLOGY IS ABOUT THE SOURCE ENTRY, NEVER ITS TRANSLATION. Both etymology.sourceLang and etymology.targetLang must describe the origin and historical development of the exact source entry "${context.query}" in ${fromName}; neither field may switch to the origin of a destination-language equivalent. Write sourceLang entirely in ${fromName}. ${definitionsOnly ? 'Leave targetLang empty.' : `Write targetLang entirely in ${toName} as a faithful translation of the same etymological facts.`} When reliable information exists, give two to four concise but informative sentences covering the relevant roots or formation, original sense, route into the language, and later development or expression history. For an expression, explain the expression as a whole rather than etymologising an unrelated translated phrase. If evidence is uncertain or genuinely unavailable, state that explicitly and do not invent a story.
 
-If the entry is a verb, make conjugationGroups a comprehensive practical inventory of the standard modern moods, tenses, aspects and non-finite forms that naturally exist in ${fromName}. Do not omit a standard form merely to keep the answer short, and do not force universal English/French tense concepts onto another language. For languages without inflectional tense, show their natural aspect, polarity, politeness and verb-form patterns instead. Include every person/pronoun form where the language normally distinguishes them. Recognised literary, historical or rare forms may be included only when clearly labelled in note. Keep repeated auxiliary constructions concise but accurate.
+If the entry is a verb, make conjugationGroups a comprehensive practical inventory of the standard modern moods, tenses, aspects and non-finite forms that naturally exist in ${fromName}. Every array item must display exactly one tense, mood, aspect or non-finite form and exactly one coverageKey. Never use an umbrella label that combines multiple tenses, such as "simple and compound historical past tenses"; split every such tense into its own labelled item. For French specifically, indicatif passé simple and indicatif passé antérieur are separate items, as are every other simple and compound tense listed by the coverage contract. Do not omit a standard form merely to keep the answer short, and do not force universal English/French tense concepts onto another language. For languages without inflectional tense, show their natural aspect, polarity, politeness and verb-form patterns instead. Include every person/pronoun form where the language normally distinguishes them. Recognised literary, historical or rare forms may be included only when clearly labelled in note. Keep repeated auxiliary constructions concise but accurate.
 
 CONJUGATION COVERAGE CONTRACT: when isVerb=true, the union of conjugationGroups.coverageKeys must contain every one of these exact machine keys:
 ${conjugationCoverage.join(', ')}
-coverageKeys are validation metadata and are not user-facing labels. Put each key on the group that actually supplies those forms; combine related keys in one group only when the displayed forms remain clear. If the entry is not a verb, return an empty conjugationGroups array.
+coverageKeys are validation metadata and are not user-facing labels. Put exactly one key on the item that supplies those forms. Never combine related keys in one item. If the entry is not a verb, return an empty conjugationGroups array.
 
 Contexts contain names and meaning indexes only, with empty examples arrays; examples are requested separately. Do not generate quiz distractors.
 
@@ -942,7 +957,7 @@ function conjugationResponseSchema(context) {
                         coverageKeys:{
                             type:'array',
                             minItems:1,
-                            maxItems:8,
+                            maxItems:1,
                             items:{ type:'string', enum:coverageKeys }
                         }
                     },
@@ -959,12 +974,12 @@ export function buildConjugationRepairRequest(context, coreResult, issues = []) 
     const required = requiredConjugationCoverage(context.fromLang);
     const system = `You are Qelumi's specialist ${fromName} verb-paradigm repair engine. Return only corrected conjugationGroups for the exact source entry. The entry has already been accepted in ${fromName} and has at least one verbal sense.
 
-Supply a comprehensive but concise source-language paradigm. Use natural ${fromName} labels. Include all person, number, gender, politeness or polarity contrasts that the language normally distinguishes. For languages without inflectional tense, supply their genuine aspect, polarity, politeness and verb-form patterns instead of inventing European-style tenses. Mark genuinely literary, historical or rare forms in note.
+Supply a comprehensive but concise source-language paradigm. Use natural ${fromName} labels. Every conjugationGroups item must represent exactly one user-facing tense, mood, aspect or non-finite form and contain exactly one coverageKey. Never group several tenses under a broad heading. In French, for example, "indicatif passé simple" and "indicatif passé antérieur" must be separate items rather than "temps simples et composés du passé historique". Include all person, number, gender, politeness or polarity contrasts that the language normally distinguishes. For languages without inflectional tense, supply their genuine aspect, polarity, politeness and verb-form patterns instead of inventing European-style tenses. Mark genuinely literary, historical or rare forms in note.
 
 The union of coverageKeys must contain every exact key below, and every key must describe forms actually shown by its group:
 ${required.join(', ')}
 
-coverageKeys are machine validation labels, not headings. Do not translate the entry and do not return any other dictionary fields. Return strict JSON matching the schema.`;
+coverageKeys are machine validation labels, not headings. Use each required key exactly once. Do not translate the entry and do not return any other dictionary fields. Return strict JSON matching the schema.`;
     return {
         contents:[{
             role:'user',
@@ -983,7 +998,7 @@ coverageKeys are machine validation labels, not headings. Do not translate the e
 
 export function buildValidationRequest(context, primaryResult, issues = []) {
     const fromName = LANGUAGES[cleanCode(context.fromLang)];
-    const system = `You are Qelumi's senior multilingual lexical validator. Resolve only source-language membership for the exact input. validLanguages is supporting evidence, not an exhaustive inventory. Decide whether it is genuinely established in requested ${fromName}, its most likely alternative language, confidence, and whether it is genuinely ambiguous or mixed-language. Established loanwords and specialised terms qualify. "backend" is established specialised French. Shared words such as apocalypse and saboteur qualify in English and French. The English offensive clipping "tard" does not qualify as the ordinary English entry. Return strict JSON only.`;
+    const system = `You are Qelumi's senior multilingual lexical validator. Resolve only source-language membership for the exact input. validLanguages is supporting evidence, not an exhaustive inventory. Decide whether it is genuinely established in requested ${fromName}, its most likely alternative language from every supported language (including one outside the current pair), confidence, and whether it is genuinely ambiguous or mixed-language. Established loanwords and specialised terms qualify. "backend" is established specialised French. Shared words such as apocalypse and saboteur qualify in English and French. The English offensive clipping "tard" does not qualify as the ordinary English entry. Return strict JSON only.`;
     return {
         contents:[{ role:'user', parts:[{ text:`Exact input: ${context.query}\nRequested source: ${context.fromLang}\nDestination: ${context.toLang}\nPrimary validation: ${JSON.stringify(primaryResult?.sourceLanguageValidation || {})}\nDetected issues: ${issues.join('; ') || 'genuine ambiguity'}` }] }],
         systemInstruction:{ parts:[{ text:system }] },
@@ -1060,6 +1075,75 @@ function singleFlight(map, key, work) {
     const promise = Promise.resolve().then(work).finally(() => map.delete(key));
     map.set(key, promise);
     return promise;
+}
+
+export function createLruTtlCache({ maxEntries = 500, ttlMs = 5 * 60_000, now = () => Date.now() } = {}) {
+    const limit = Math.max(1, Math.floor(Number(maxEntries) || 500));
+    const defaultTtlMs = Math.max(1, Number(ttlMs) || 5 * 60_000);
+    const entries = new Map();
+    const metrics = { hits:0, misses:0, evictions:0, expirations:0, invalidations:0 };
+
+    const removeExpired = (key, entry, currentTime) => {
+        if (!entry || entry.expiresAt > currentTime) return false;
+        entries.delete(key);
+        metrics.expirations += 1;
+        return true;
+    };
+    const purgeExpired = currentTime => {
+        for (const [key, entry] of entries) removeExpired(key, entry, currentTime);
+    };
+
+    return {
+        get(key) {
+            const currentTime = now();
+            const entry = entries.get(key);
+            if (!entry || removeExpired(key, entry, currentTime)) {
+                metrics.misses += 1;
+                return undefined;
+            }
+            entries.delete(key);
+            entries.set(key, entry);
+            metrics.hits += 1;
+            return clone(entry.value);
+        },
+        set(key, value, entryTtlMs = defaultTtlMs) {
+            purgeExpired(now());
+            if (entries.has(key)) entries.delete(key);
+            entries.set(key, {
+                value:clone(value),
+                expiresAt:now() + Math.max(1, Number(entryTtlMs) || defaultTtlMs)
+            });
+            while (entries.size > limit) {
+                entries.delete(entries.keys().next().value);
+                metrics.evictions += 1;
+            }
+        },
+        delete(key) {
+            const removed = entries.delete(key);
+            if (removed) metrics.invalidations += 1;
+            return removed;
+        },
+        deleteMatching(predicate) {
+            let removed = 0;
+            for (const key of entries.keys()) {
+                if (!predicate(key)) continue;
+                entries.delete(key);
+                removed += 1;
+            }
+            metrics.invalidations += removed;
+            return removed;
+        },
+        clear() {
+            const removed = entries.size;
+            entries.clear();
+            metrics.invalidations += removed;
+            return removed;
+        },
+        stats() {
+            purgeExpired(now());
+            return { ...metrics, entries:entries.size, maxEntries:limit, ttlMs:defaultTtlMs };
+        }
+    };
 }
 
 function usageMetrics(data) {
@@ -1193,34 +1277,28 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     const previewFallbackTimeoutMs = Math.max(2_000, Number(process.env.GEMINI_PREVIEW_FALLBACK_TIMEOUT_MS || Math.min(fallbackTimeoutMs, 12_000)));
     const cacheReadTimeoutMs = Math.max(1_000, Number(process.env.DICTIONARY_READ_TIMEOUT_MS || 4_000));
     const cacheWriteTimeoutMs = Math.max(1_000, Number(process.env.DICTIONARY_WRITE_TIMEOUT_MS || 5_000));
-        const l1CoreCache = new Map();
-    const l1PreviewCache = new Map();
-    const l1ContextsCache = new Map();
-    const l1DistractorCache = new Map();
-    const MAX_L1_ENTRIES = 1000;
-
-    function getL1(cache, key) {
-        const entry = cache.get(key);
-        if (!entry) return null;
-        if (Date.now() > entry.expiresAt) {
-            cache.delete(key);
-            return null;
-        }
-        cache.delete(key);
-        cache.set(key, entry);
-        return entry.value;
-    }
-
-    function setL1(cache, key, value, ttlMs) {
-        if (cache.size >= MAX_L1_ENTRIES) cache.delete(cache.keys().next().value);
-        cache.set(key, { value, expiresAt: Date.now() + ttlMs });
-    }
+    const l1TtlMs = Math.max(5_000, Number(process.env.L1_CACHE_TTL_MS || 5 * 60_000));
+    const l1NegativeTtlMs = Math.max(5_000, Math.min(
+        l1TtlMs,
+        Number(process.env.L1_NEGATIVE_CACHE_TTL_MS || 90_000)
+    ));
+    const l1MaxEntries = Math.max(25, Math.min(5_000, Number(process.env.L1_CACHE_MAX_ENTRIES || 500)));
+    const l1Cache = createLruTtlCache({ maxEntries:l1MaxEntries, ttlMs:l1TtlMs });
     const previewFlights = new Map();
     const coreFlights = new Map();
     const exampleFlights = new Map();
     const distractorFlights = new Map();
     const successfulCompatibilityModes = new Map();
     const dictionaryRef = context => db.doc(`artifacts/${process.env.APP_ID || 'linguist-app-v7'}/public/data/global_dictionary/${dictionaryDocumentId(context.query, context.fromLang, context.toLang)}`);
+    const dictionaryCacheKey = (kind, context) =>
+        `${kind}|schema:${DICTIONARY_SCHEMA_VERSION}|preview:${PREVIEW_SCHEMA_VERSION}|${dictionaryDocumentId(context.query, context.fromLang, context.toLang)}`;
+    const cacheTtlForResult = result =>
+        result?.sourceLanguageValidation?.existsInRequestedLanguage === true && result?.wordExists === true
+            ? l1TtlMs : l1NegativeTtlMs;
+    const invalidateDocumentId = documentId => l1Cache.deleteMatching(key => key.endsWith(`|${documentId}`));
+    const invalidateContext = context => invalidateDocumentId(
+        dictionaryDocumentId(context.query, context.fromLang, context.toLang)
+    );
 
     function withDeadline(promise, timeoutMs, label) {
         let timer;
@@ -1351,11 +1429,54 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         } catch (_) { return null; }
     }
 
+    function cacheCoreEnvelope(context, result, metadata = {}) {
+        if (!result) return;
+        l1Cache.set(dictionaryCacheKey('core', context), {
+            result,
+            schemaVersion:Number(metadata.schemaVersion || DICTIONARY_SCHEMA_VERSION),
+            updatedAt:Number(metadata.updatedAt || Date.now()),
+            expiresAt:Number(metadata.expiresAt || 0),
+            staleUntil:Number(metadata.staleUntil || 0)
+        }, cacheTtlForResult(result));
+        const preview = previewFromCore(result, context);
+        if (previewQualityIssues(preview, context).length === 0) {
+            l1Cache.set(dictionaryCacheKey('preview', context), {
+                preview,
+                updatedAt:Number(metadata.updatedAt || Date.now()),
+                expiresAt:Number(metadata.previewExpiresAt || metadata.expiresAt || (Date.now() + cacheTtlForResult(result)))
+            }, cacheTtlForResult(result));
+        }
+    }
+
+    function cacheStoredCore(context, cached) {
+        if (!cached?.result) return;
+        cacheCoreEnvelope(context, cached.result, {
+            schemaVersion:cached.stored?.schemaVersion,
+            updatedAt:cached.updatedAt,
+            expiresAt:cached.stored?.expiresAt,
+            staleUntil:cached.stored?.staleUntil,
+            previewExpiresAt:cached.stored?.previewExpiresAt
+        });
+    }
+
+    function cachePreviewEnvelope(context, preview, metadata = {}) {
+        if (!preview || previewQualityIssues(preview, context).length) return;
+        l1Cache.set(dictionaryCacheKey('preview', context), {
+            preview,
+            updatedAt:Number(metadata.updatedAt || Date.now()),
+            expiresAt:Number(metadata.expiresAt || (Date.now() + cacheTtlForResult(preview)))
+        }, cacheTtlForResult(preview));
+    }
+
     async function savePreview(context, preview, metadata = {}) {
         const ref = dictionaryRef(context);
         const now = Date.now();
         const accepted = preview?.sourceLanguageValidation?.existsInRequestedLanguage === true
             && preview.wordExists === true;
+        cachePreviewEnvelope(context, preview, {
+            updatedAt:now,
+            expiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs)
+        });
         await writeDictionary(ref, {
             queryLower:normalizeDictionaryQuery(context.query),
             originalQuery:context.query,
@@ -1382,6 +1503,13 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         const contextsComplete = contextsAreComplete(merged, context);
         const accepted = merged?.sourceLanguageValidation?.existsInRequestedLanguage === true && merged.wordExists === true;
         const preview = previewFromCore(merged, context);
+        cacheCoreEnvelope(context, merged, {
+            schemaVersion:DICTIONARY_SCHEMA_VERSION,
+            updatedAt:now,
+            expiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs),
+            staleUntil:now + (accepted ? staleTtlMs : mismatchTtlMs),
+            previewExpiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs)
+        });
         await writeDictionary(ref, {
             queryLower:normalizeDictionaryQuery(context.query), originalQuery:context.query,
             fromLang:context.fromLang, toLang:context.toLang,
@@ -1501,19 +1629,32 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function getPreview(context, uid) {
         const started = performance.now();
-        const ref = dictionaryRef(context);
-        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
-        const l1Hit = getL1(l1PreviewCache, flightKey);
-        if (l1Hit) {
-            const cacheLookupMs = Math.round(performance.now() - started);
-            recordUsage(uid, 'translation_preview_cache_hit', { cacheStatus:'fresh_l1', cacheLookupMs, latencyMs:cacheLookupMs, fromLang:context.fromLang, toLang:context.toLang }).catch(() => {});
-            return { preview: l1Hit, meta:{ phase:'preview', source:'in_memory', cacheStatus:'fresh_l1', previewSchemaVersion:PREVIEW_SCHEMA_VERSION, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+        const now = Date.now();
+        const l1Preview = l1Cache.get(dictionaryCacheKey('preview', context));
+        if (l1Preview?.preview
+            && (!l1Preview.expiresAt || l1Preview.expiresAt > now)
+            && previewQualityIssues(l1Preview.preview, context).length === 0) {
+            const latencyMs = Math.round(performance.now() - started);
+            recordUsage(uid, 'translation_preview_cache_hit', {
+                cacheStatus:'render_l1', cacheLookupMs:latencyMs, latencyMs,
+                fromLang:context.fromLang, toLang:context.toLang
+            }).catch(() => {});
+            return {
+                preview:l1Preview.preview,
+                meta:{
+                    phase:'preview', source:'render_l1', cacheStatus:'l1',
+                    previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
+                    cacheLookupMs:latencyMs, latencyMs,
+                    fallbackUsed:false, modelCalls:[]
+                }
+            };
         }
+        const ref = dictionaryRef(context);
         const snapshot = await readDictionary(ref, 'Preview-cache lookup');
         const cacheLookupMs = Math.round(performance.now() - started);
-        const now = Date.now();
         const cachedCore = parseStored(snapshot, context);
         if (cachedCore?.result) {
+            cacheStoredCore(context, cachedCore);
             const age = cachedCore.updatedAt ? now - cachedCore.updatedAt : Infinity;
             const accepted = cachedCore.result?.sourceLanguageValidation?.existsInRequestedLanguage === true
                 && cachedCore.result.wordExists === true;
@@ -1546,6 +1687,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             && Number(cachedPreview.stored?.previewSchemaVersion || 0) >= PREVIEW_SCHEMA_VERSION
             && cachedPreview.expiresAt > now
             && previewQualityIssues(cachedPreview.preview, context).length === 0) {
+            cachePreviewEnvelope(context, cachedPreview.preview, {
+                updatedAt:cachedPreview.updatedAt,
+                expiresAt:cachedPreview.expiresAt
+            });
             recordUsage(uid, 'translation_preview_cache_hit', {
                 cacheStatus:'preview', cacheLookupMs, latencyMs:cacheLookupMs,
                 fromLang:context.fromLang, toLang:context.toLang
@@ -1565,10 +1710,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             };
         }
 
+        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
         const generated = await singleFlight(previewFlights, flightKey, () => generatePreview(context, uid));
         generated.meta.cacheLookupMs = cacheLookupMs;
         generated.meta.latencyMs = Math.round(performance.now() - started);
-        if (generated.preview && generated.preview.wordExists !== false) setL1(l1PreviewCache, flightKey, generated.preview, freshTtlMs);
         return generated;
     }
 
@@ -1580,6 +1725,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         const onlyConjugationIssues = issues => issues.length > 0 && issues.every(issue =>
             issue === 'missing language-specific conjugations'
             || issue.startsWith('incomplete conjugation coverage:')
+            || issue === 'conjugation entries must each represent one tense or form'
+            || issue.startsWith('duplicate conjugation coverage:')
         );
         const repairConjugations = async (candidate, candidateIssues) => {
             if (!candidate?.isVerb || !onlyConjugationIssues(candidateIssues)) {
@@ -1711,20 +1858,26 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     async function getCore(context, uid, { forceRefresh = false, touch = true } = {}) {
         const started = performance.now();
         const ref = dictionaryRef(context);
-        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
-        if (!forceRefresh) {
-            const l1Hit = getL1(l1CoreCache, flightKey);
-            if (l1Hit) {
-                const cacheLookupMs = Math.round(performance.now() - started);
-                if (touch) {
-                    recordUsage(uid, 'translation_cache_hit', { cacheStatus:'fresh_l1', cacheLookupMs, latencyMs:cacheLookupMs, fromLang:context.fromLang, toLang:context.toLang }).catch(() => {});
-                }
-                return { result: l1Hit, meta:{ source:'in_memory', cacheStatus:'fresh_l1', schemaVersion:DICTIONARY_SCHEMA_VERSION, contextsReady:contextsAreComplete(l1Hit, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
-            }
+        if (forceRefresh) invalidateContext(context);
+
+        let cacheOrigin = 'render_l1';
+        const l1Cached = !forceRefresh ? l1Cache.get(dictionaryCacheKey('core', context)) : null;
+        let cached = l1Cached ? {
+            result:l1Cached.result,
+            stored:{
+                schemaVersion:l1Cached.schemaVersion,
+                expiresAt:l1Cached.expiresAt,
+                staleUntil:l1Cached.staleUntil
+            },
+            updatedAt:l1Cached.updatedAt
+        } : null;
+        if (!cached) {
+            cacheOrigin = 'firestore';
+            const snapshot = await readDictionary(ref);
+            cached = parseStored(snapshot, context);
+            if (!forceRefresh) cacheStoredCore(context, cached);
         }
-        const snapshot = await readDictionary(ref);
         const cacheLookupMs = Math.round(performance.now() - started);
-        const cached = parseStored(snapshot, context);
         const cachedIssues = cached?.result ? coreQualityIssues(cached.result, context) : ['cache miss'];
         const age = cached?.updatedAt ? Date.now() - cached.updatedAt : Infinity;
         const cachedSchemaVersion = Number(cached?.stored?.schemaVersion || 0);
@@ -1734,24 +1887,28 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         ]);
         // Learning metadata was introduced in schema v12. A structurally sound older
         // non-verb may still render immediately while its background refresh upgrades
-        // it. Missing schema-v13 conjugation coverage and schema-v14 per-meaning
-        // grammatical classifications remain blocking.
+        // it. Missing schema-v13 coverage metadata, schema-v14 per-meaning
+        // grammatical classifications, and schema-v15 one-tense-per-item
+        // paradigms remain blocking.
         const cacheBlockingIssues = needsSchemaRefresh
             ? cachedIssues.filter(issue => !upgradeOnlyIssues.has(issue))
             : cachedIssues;
         const negativeExpiry = Number(cached?.stored?.expiresAt || 0);
+        const accepted = cached?.result?.sourceLanguageValidation?.existsInRequestedLanguage === true
+            && cached?.result?.wordExists === true;
         const cacheUsable = cached?.result && cacheBlockingIssues.length === 0
-            && (cached.result.sourceLanguageValidation?.existsInRequestedLanguage !== false || negativeExpiry > Date.now());
+            && (accepted || negativeExpiry > Date.now());
 
         if (!forceRefresh && cacheUsable && age <= freshTtlMs && !needsSchemaRefresh) {
             if (touch) {
                 ref.update({ useCount:FieldValue.increment(1), lastUsedAt:Date.now() }).catch(() => {});
                 recordUsage(uid, 'translation_cache_hit', {
-                    cacheStatus:'fresh', cacheLookupMs, latencyMs:cacheLookupMs,
+                    cacheStatus:cacheOrigin === 'render_l1' ? 'render_l1' : 'fresh',
+                    cacheLookupMs, latencyMs:cacheLookupMs,
                     fromLang:context.fromLang, toLang:context.toLang
                 }).catch(() => {});
             }
-            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:'fresh', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:cacheOrigin === 'render_l1' ? 'l1' : 'fresh', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
         }
 
         if (!forceRefresh && cacheUsable && age <= staleTtlMs) {
@@ -1761,18 +1918,19 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             if (touch) {
                 ref.update({ useCount:FieldValue.increment(1), lastUsedAt:Date.now() }).catch(() => {});
                 recordUsage(uid, 'translation_cache_hit', {
-                    cacheStatus:needsSchemaRefresh ? 'schema_upgrade' : 'stale',
+                    cacheStatus:needsSchemaRefresh ? 'schema_upgrade'
+                        : cacheOrigin === 'render_l1' ? 'render_l1_stale' : 'stale',
                     cacheLookupMs, latencyMs:cacheLookupMs,
                     fromLang:context.fromLang, toLang:context.toLang
                 }).catch(() => {});
             }
-            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:needsSchemaRefresh ? 'schema_upgrade' : 'stale', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:true, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:needsSchemaRefresh ? 'schema_upgrade' : cacheOrigin === 'render_l1' ? 'l1_stale' : 'stale', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:true, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
         }
 
+        const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
         const generated = await singleFlight(coreFlights, flightKey, () => generateCore(context, uid, cached?.result));
         generated.meta.cacheLookupMs = cacheLookupMs;
         generated.meta.latencyMs = Math.round(performance.now() - started);
-        if (generated.preview && generated.preview.wordExists !== false) setL1(l1PreviewCache, flightKey, generated.preview, freshTtlMs);
         return generated;
     }
 
@@ -1816,12 +1974,6 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function getContexts(context, uid) {
         const started = performance.now();
-        const flightKey = `${dictionaryIdentity(context.query, context.fromLang, context.toLang)}|contexts`;
-        const l1Hit = getL1(l1ContextsCache, flightKey);
-        if (l1Hit) {
-            const cacheLookupMs = Math.round(performance.now() - started);
-            return { contexts: l1Hit, meta: { source: 'in_memory', cacheStatus: 'fresh_l1', contextsReady: true, latencyMs: cacheLookupMs, fallbackUsed: false, modelCalls: [] } };
-        }
         const coreResponse = await getCore(context, uid, { touch:false });
         const coreResult = coreResponse.result;
         if (!coreResult?.sourceLanguageValidation?.existsInRequestedLanguage || !coreResult.wordExists) {
@@ -1830,8 +1982,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         if (contextsAreComplete(coreResult, context)) {
             return { contexts:coreResult.contexts, meta:{ source:'global_dictionary', cacheStatus:'fresh', contextsReady:true, latencyMs:Math.round(performance.now() - started), fallbackUsed:false, modelCalls:[] } };
         }
-        
-        return singleFlight(exampleFlights, flightKey, async () => {
+        const key = `${dictionaryIdentity(context.query, context.fromLang, context.toLang)}|contexts`;
+        return singleFlight(exampleFlights, key, async () => {
             const count = examplesPerContext(coreResult.contexts.length);
             const generated = await Promise.all(coreResult.contexts.map(item => generateContextExamples(context, coreResult, item, count, uid)));
             const completed = { ...coreResult, contexts:generated.map(item => item.context) };
@@ -1847,23 +1999,27 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 compatibilityMode:call.compatibilityMode, compatibilityRetries:call.compatibilityRetries,
                 ...call.tokens
             }));
-            const res = {
+            return {
                 contexts:saved.contexts,
                 meta:{ source:'generated', cacheStatus:'miss', contextsReady:true,
                     fallbackUsed:generated.some(item => item.fallbackUsed),
                     fallbackReason:generated.filter(item => item.fallbackReason).map(item => item.fallbackReason).join(','),
                     latencyMs:Math.round(performance.now() - started), modelCalls:calls }
             };
-            setL1(l1ContextsCache, flightKey, saved.contexts, freshTtlMs);
-            return res;
         });
     }
 
     async function getDistractors(context, uid) {
         const correctKey = normalizeDictionaryQuery(context.correct);
         const key = crypto.createHash('sha256').update(JSON.stringify({ ...context, correct:correctKey })).digest('hex');
-        const l1Hit = getL1(l1DistractorCache, key);
-        if (l1Hit) return l1Hit;
+        const l1Key = `distractors|schema:1|${key}`;
+        const cached = l1Cache.get(l1Key);
+        if (cached?.distractors?.length) {
+            return {
+                distractors:cached.distractors,
+                meta:{ source:'render_l1', cacheStatus:'l1', latencyMs:0 }
+            };
+        }
         return singleFlight(distractorFlights, key, async () => {
             let response;
             try {
@@ -1884,20 +2040,26 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             const distractors = cleanTextArray(response.result?.distractors, 4)
                 .filter(value => normalizeDictionaryQuery(value) !== correctKey).slice(0, context.count || 4);
             if (distractors.length < Math.min(2, context.count || 4)) throw Object.assign(new Error('Not enough realistic distractors were generated.'), { status:502 });
-            const res = { distractors, meta:{
+            l1Cache.set(l1Key, { distractors });
+            return { distractors, meta:{
                 model:response.model, thinkingLevel:response.thinkingLevel, latencyMs:response.latencyMs,
                 compatibilityMode:response.compatibilityMode, compatibilityRetries:response.compatibilityRetries,
                 ...response.tokens
             } };
-            setL1(l1DistractorCache, key, res, freshTtlMs);
-            return res;
         });
     }
 
     return {
         getPreview, getCore, getContexts, getDistractors, saveCachedResult,
+        invalidateContext,
+        invalidateDocumentId,
+        clearL1Cache:() => l1Cache.clear(),
+        l1Stats:() => l1Cache.stats(),
         models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
-        cache:{ freshTtlMs, staleTtlMs, mismatchTtlMs, cacheReadTimeoutMs, cacheWriteTimeoutMs },
+        cache:{
+            freshTtlMs, staleTtlMs, mismatchTtlMs, cacheReadTimeoutMs, cacheWriteTimeoutMs,
+            l1TtlMs, l1NegativeTtlMs, l1MaxEntries
+        },
         previewSchemaVersion:PREVIEW_SCHEMA_VERSION
     };
 }

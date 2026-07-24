@@ -16,7 +16,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.0.5';
+const BACKEND_VERSION = '4.1.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -336,6 +336,13 @@ app.get('/health', (_req, res) => res.json({
         mobileBridge:true, performanceDashboard:true
     },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
+    renderCache:{
+        enabled:true,
+        ttlMs:translationService.cache.l1TtlMs,
+        negativeTtlMs:translationService.cache.l1NegativeTtlMs,
+        maxEntries:translationService.cache.l1MaxEntries,
+        ...translationService.l1Stats()
+    },
     feedbackEmailConfigured:!!(resend && FEEDBACK_EMAIL_FROM && FEEDBACK_EMAIL_TO),
     costRatesConfigured:!!(
         Number(process.env.GEMINI_PRIMARY_INPUT_USD_PER_MILLION || 0)
@@ -594,8 +601,17 @@ app.get('/api/admin/dictionary', requireUser, requireAdmin, async (req, res) => 
     res.json({ entries:snapshot.docs.map(document => ({ id:document.id, path:document.ref.path, ...document.data(), fullJSON:undefined })) });
 });
 
+app.post('/api/admin/cache/clear', requireUser, requireAdmin, async (_req, res) => {
+    const removed = translationService.clearL1Cache();
+    res.json({ ok:true, removed, cache:translationService.l1Stats() });
+});
+
 app.delete('/api/admin/dictionary/:id', requireUser, requireAdmin, async (req, res) => {
+    if (!/^[a-f0-9]{64}$/i.test(req.params.id)) {
+        return res.status(400).json({ error:{ message:'Invalid dictionary entry identifier.' } });
+    }
     await db.doc(`artifacts/${APP_ID}/public/data/global_dictionary/${req.params.id}`).delete();
+    translationService.invalidateDocumentId(req.params.id);
     res.json({ ok:true });
 });
 
