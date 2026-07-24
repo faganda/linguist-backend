@@ -8,17 +8,15 @@ import crypto from 'node:crypto';
 import {
     LANGUAGES, PRIMARY_MODEL, PRIMARY_THINKING, FALLBACK_MODEL, FALLBACK_THINKING,
     DICTIONARY_SCHEMA_VERSION, PREVIEW_SCHEMA_VERSION, createTranslationService, buildGeminiCompatibilityRequests,
-    geminiCompatibilityKey, isGeminiInvalidArgument, parseGeminiJSON, dictionaryDocumentId,
-    normalizeTranslationResult, coreQualityIssues
+    geminiCompatibilityKey, isGeminiInvalidArgument, parseGeminiJSON
 } from './translation-service.js';
 import {
-    buildLearningRequest, correctionDocumentId, sanitizeCorrectionValue,
-    summarizePerformanceEvents
+    buildLearningRequest, summarizePerformanceEvents
 } from './learning-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.0.3';
+const BACKEND_VERSION = '4.0.4';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -45,7 +43,6 @@ const db = getFirestore();
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const feedbackCollection = () => db.collection('artifacts').doc(APP_ID).collection('public').doc('data').collection('feedback');
-const correctionsCollection = () => db.collection('artifacts').doc(APP_ID).collection('public').doc('data').collection('corrections');
 const translationSearchCollection = () => db.collection('admin_metrics').doc('translation_searches').collection('items');
 const timestampMillis = value => value?.toMillis?.() || Number(value) || 0;
 const htmlEscape = value => String(value ?? '').replace(/[&<>"']/g, character => ({
@@ -60,13 +57,6 @@ const sourceLabel = value => ({
     personal_history:'Already in user history', image_analysis:'New image analysis',
     language_validation:'Language validation'
 }[value] || 'Unknown');
-const correctionSections = new Set([
-    'mainTranslation', 'pronunciationGuide', 'partOfSpeech', 'formality', 'learningMetadata',
-    'etymology', 'conjugationGroups', 'definitions', 'meanings', 'synonyms',
-    'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes',
-    'regionalVariants', 'wordFamily', 'contexts'
-]);
-
 app.disable('x-powered-by');
 
 // This route must receive the unparsed request body so Resend's signature can be verified.
@@ -342,7 +332,7 @@ app.get('/health', (_req, res) => res.json({
     progressiveTranslation:{ enabled:true, previewSchemaVersion:PREVIEW_SCHEMA_VERSION },
     learningFeatures:{
         contextLens:true, mistakes:true, shadowing:true, conversations:true,
-        stories:true, cefr:true, writingCoach:true, verifiedCorrections:true,
+        stories:true, cefr:true, writingCoach:true,
         mobileBridge:true, performanceDashboard:true
     },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
@@ -504,51 +494,6 @@ app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10,
     }
 });
 
-app.post('/api/corrections', requireUser,
-    rateLimit({ windowMs:60 * 60_000, max:20, key:req => `corrections:${req.user.uid}` }),
-    async (req, res) => {
-        try {
-            const query = String(req.body?.query || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').slice(0, 300);
-            const fromLang = String(req.body?.fromLang || '').trim().toUpperCase();
-            const toLang = String(req.body?.toLang || '').trim().toUpperCase();
-            const section = String(req.body?.section || '').trim();
-            const issue = String(req.body?.issue || '').trim().slice(0, 4_000);
-            if (!query || !LANGUAGES[fromLang] || !LANGUAGES[toLang] || !correctionSections.has(section) || !issue) {
-                return res.status(400).json({ error:{ message:'A word, language pair, section and explanation are required.' } });
-            }
-            const proposedValue = sanitizeCorrectionValue(req.body?.proposedValue);
-            const createdAt = Date.now();
-            const id = correctionDocumentId(req.user.uid, query, fromLang, toLang, section, createdAt);
-            const dictionaryEntryId = dictionaryDocumentId(query, fromLang, toLang);
-            await correctionsCollection().doc(id).set({
-                uid:req.user.uid,
-                userEmail:req.user.email || '',
-                query,
-                queryLower:query.toLocaleLowerCase(),
-                fromLang,
-                toLang,
-                dictionaryEntryId,
-                section,
-                issue,
-                proposedValue,
-                status:'pending',
-                createdAt,
-                submittedAt:FieldValue.serverTimestamp()
-            });
-            res.status(201).json({ ok:true, id, status:'pending' });
-        } catch (error) {
-            res.status(error.status || 500).json({ error:{ message:error.message } });
-        }
-    });
-
-app.get('/api/corrections/mine', requireUser, async (req, res) => {
-    const limit = Math.min(Number(req.query.limit) || 100, 250);
-    const snapshot = await correctionsCollection().orderBy('createdAt', 'desc').limit(1_000).get();
-    const corrections = snapshot.docs.map(document => ({ id:document.id, ...document.data() }))
-        .filter(item => item.uid === req.user.uid).slice(0, limit);
-    res.json({ corrections });
-});
-
 app.post('/api/translation-events', requireUser, rateLimit({ windowMs:60 * 60_000, max:300, key:req => `translation-events:${req.user.uid}` }), async (req, res) => {
     const query = String(req.body?.query || '').normalize('NFKC').trim().replace(/\s+/g, ' ').slice(0, 300);
     const fromLang = String(req.body?.fromLang || '').toUpperCase().slice(0, 5);
@@ -641,93 +586,6 @@ app.get('/api/admin/performance', requireUser, requireAdmin, async (req, res) =>
         ),
         ...summarizePerformanceEvents(events)
     });
-});
-
-app.get('/api/admin/corrections', requireUser, requireAdmin, async (req, res) => {
-    const limit = Math.min(Number(req.query.limit) || 1_000, 2_000);
-    const snapshot = await correctionsCollection().orderBy('createdAt', 'desc').limit(limit).get();
-    res.json({
-        corrections:snapshot.docs.map(document => ({
-            id:document.id, ...document.data(),
-            submittedAt:timestampMillis(document.data().submittedAt),
-            reviewedAt:timestampMillis(document.data().reviewedAt)
-        }))
-    });
-});
-
-app.patch('/api/admin/corrections/:id', requireUser, requireAdmin, async (req, res) => {
-    const correctionRef = correctionsCollection().doc(req.params.id);
-    const snapshot = await correctionRef.get();
-    if (!snapshot.exists) return res.status(404).json({ error:{ message:'Correction request not found.' } });
-    const correction = snapshot.data();
-    const action = String(req.body?.action || '').toLowerCase();
-    const reviewNote = String(req.body?.reviewNote || '').trim().slice(0, 2_000);
-    if (!['approve', 'reject'].includes(action)) {
-        return res.status(400).json({ error:{ message:'Choose approve or reject.' } });
-    }
-    if (action === 'reject') {
-        await correctionRef.update({
-            status:'rejected', reviewNote, reviewedBy:req.user.uid,
-            reviewedAt:FieldValue.serverTimestamp()
-        });
-        return res.json({ ok:true, status:'rejected' });
-    }
-
-    try {
-        const approvedValue = sanitizeCorrectionValue(
-            Object.prototype.hasOwnProperty.call(req.body || {}, 'approvedValue')
-                ? req.body.approvedValue : correction.proposedValue
-        );
-        if (approvedValue == null || approvedValue === '') {
-            return res.status(400).json({ error:{ message:'An approved replacement value is required.' } });
-        }
-        if (!correctionSections.has(correction.section)) {
-            return res.status(400).json({ error:{ message:'This dictionary section cannot be overridden.' } });
-        }
-        const dictionaryRef = db.doc(`artifacts/${APP_ID}/public/data/global_dictionary/${correction.dictionaryEntryId}`);
-        const dictionarySnapshot = await dictionaryRef.get();
-        if (!dictionarySnapshot.exists) {
-            return res.status(404).json({ error:{ message:'The corresponding global-dictionary entry no longer exists.' } });
-        }
-        const stored = dictionarySnapshot.data();
-        const raw = typeof stored.fullJSON === 'string' ? JSON.parse(stored.fullJSON) : stored.translation;
-        const candidate = { ...raw, [correction.section]:approvedValue };
-        const context = {
-            query:correction.query,
-            fromLang:correction.fromLang,
-            toLang:correction.toLang,
-            definitionsOnly:correction.fromLang === correction.toLang
-        };
-        const normalized = normalizeTranslationResult(candidate, context);
-        const issues = coreQualityIssues(normalized, context);
-        if (issues.length) {
-            return res.status(400).json({
-                error:{ message:`The proposed replacement would make the entry incomplete: ${issues.join(', ')}.` }
-            });
-        }
-        await dictionaryRef.update({
-            fullJSON:JSON.stringify(normalized),
-            schemaVersion:DICTIONARY_SCHEMA_VERSION,
-            modelVersion:DICTIONARY_SCHEMA_VERSION,
-            coreComplete:true,
-            status:stored.contextsComplete ? 'verified' : 'core_ready',
-            adminOverrideSections:FieldValue.arrayUnion(correction.section),
-            overrideCount:FieldValue.increment(1),
-            lastOverrideAt:FieldValue.serverTimestamp(),
-            updatedAt:Date.now()
-        });
-        await correctionRef.update({
-            status:'approved',
-            approvedValue,
-            reviewNote,
-            reviewedBy:req.user.uid,
-            reviewedAt:FieldValue.serverTimestamp(),
-            appliedToDictionary:true
-        });
-        res.json({ ok:true, status:'approved', dictionaryEntryId:correction.dictionaryEntryId });
-    } catch (error) {
-        res.status(error.status || 500).json({ error:{ message:error.message || 'Unable to apply the correction.' } });
-    }
 });
 
 app.get('/api/admin/dictionary', requireUser, requireAdmin, async (req, res) => {

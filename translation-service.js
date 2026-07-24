@@ -18,7 +18,7 @@ export const CEFR_LEVELS = Object.freeze(['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'U
 export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less common', 'Rare', 'Specialized']);
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 
-export const DICTIONARY_SCHEMA_VERSION = 12;
+export const DICTIONARY_SCHEMA_VERSION = 13;
 export const PREVIEW_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
@@ -27,6 +27,102 @@ export const FALLBACK_THINKING = process.env.GEMINI_FALLBACK_THINKING || 'low';
 
 const ORDINARY_USAGE = new Set(['standard', 'common', 'specialized']);
 const NON_QUALIFYING_USAGE = new Set(['rare', 'archaic', 'abbreviation', 'fragment', 'proper-name', 'offensive-clipping', 'invalid']);
+
+// These machine-readable keys are never displayed. They let the backend verify
+// that a model covered the source language's own verb system instead of merely
+// returning two or three familiar tenses. Related keys may share one displayed
+// group when that is natural for the language.
+export const CONJUGATION_COVERAGE = Object.freeze({
+    EN:Object.freeze([
+        'present_simple', 'past_simple', 'future_simple',
+        'present_continuous', 'past_continuous', 'future_continuous',
+        'present_perfect', 'past_perfect', 'future_perfect',
+        'present_perfect_continuous', 'past_perfect_continuous', 'future_perfect_continuous',
+        'conditional_present', 'conditional_perfect', 'imperative', 'subjunctive', 'non_finite_forms'
+    ]),
+    FR:Object.freeze([
+        'indicatif_present', 'indicatif_imparfait', 'indicatif_passe_compose',
+        'indicatif_plus_que_parfait', 'indicatif_passe_simple', 'indicatif_passe_anterieur',
+        'indicatif_futur_simple', 'indicatif_futur_anterieur',
+        'subjonctif_present', 'subjonctif_passe', 'subjonctif_imparfait', 'subjonctif_plus_que_parfait',
+        'conditionnel_present', 'conditionnel_passe',
+        'imperatif_present', 'imperatif_passe',
+        'infinitif_present', 'infinitif_passe',
+        'participe_present', 'participe_passe', 'gerondif_present', 'gerondif_passe'
+    ]),
+    ES:Object.freeze([
+        'indicativo_presente', 'indicativo_imperfecto', 'indicativo_preterito',
+        'indicativo_futuro', 'indicativo_perfecto', 'indicativo_pluscuamperfecto',
+        'indicativo_preterito_anterior', 'indicativo_futuro_perfecto',
+        'condicional_simple', 'condicional_compuesto',
+        'subjuntivo_presente', 'subjuntivo_imperfecto', 'subjuntivo_futuro',
+        'subjuntivo_perfecto', 'subjuntivo_pluscuamperfecto', 'subjuntivo_futuro_perfecto',
+        'imperativo_afirmativo', 'imperativo_negativo',
+        'infinitivo_simple', 'infinitivo_compuesto', 'gerundio_simple', 'gerundio_compuesto', 'participio'
+    ]),
+    DE:Object.freeze([
+        'indikativ_praesens', 'indikativ_praeteritum', 'indikativ_perfekt',
+        'indikativ_plusquamperfekt', 'indikativ_futur_i', 'indikativ_futur_ii',
+        'konjunktiv_i_praesens', 'konjunktiv_i_perfekt', 'konjunktiv_i_futur_i', 'konjunktiv_i_futur_ii',
+        'konjunktiv_ii_praeteritum', 'konjunktiv_ii_plusquamperfekt',
+        'imperativ', 'infinitiv_i', 'infinitiv_ii', 'partizip_i', 'partizip_ii'
+    ]),
+    IT:Object.freeze([
+        'indicativo_presente', 'indicativo_imperfetto', 'indicativo_passato_prossimo',
+        'indicativo_passato_remoto', 'indicativo_trapassato_prossimo', 'indicativo_trapassato_remoto',
+        'indicativo_futuro_semplice', 'indicativo_futuro_anteriore',
+        'congiuntivo_presente', 'congiuntivo_imperfetto', 'congiuntivo_passato', 'congiuntivo_trapassato',
+        'condizionale_presente', 'condizionale_passato',
+        'imperativo', 'infinito_presente', 'infinito_passato',
+        'participio_presente', 'participio_passato', 'gerundio_presente', 'gerundio_passato'
+    ]),
+    PT:Object.freeze([
+        'indicativo_presente', 'indicativo_preterito_perfeito', 'indicativo_preterito_imperfeito',
+        'indicativo_mais_que_perfeito', 'indicativo_futuro', 'indicativo_condicional',
+        'indicativo_preterito_perfeito_composto', 'indicativo_mais_que_perfeito_composto',
+        'indicativo_futuro_composto', 'indicativo_condicional_composto',
+        'subjuntivo_presente', 'subjuntivo_imperfeito', 'subjuntivo_futuro',
+        'subjuntivo_perfeito', 'subjuntivo_mais_que_perfeito', 'subjuntivo_futuro_composto',
+        'imperativo_afirmativo', 'imperativo_negativo',
+        'infinitivo_impessoal', 'infinitivo_impessoal_composto',
+        'infinitivo_pessoal', 'infinitivo_pessoal_composto',
+        'gerundio', 'gerundio_composto', 'participio'
+    ]),
+    ZH:Object.freeze([
+        'invariant_base', 'perfective_le', 'experiential_guo', 'progressive_zai',
+        'durative_zhe', 'negative_bu', 'negative_mei', 'modal_future_possibility'
+    ]),
+    JA:Object.freeze([
+        'plain_nonpast_affirmative', 'plain_nonpast_negative', 'plain_past_affirmative', 'plain_past_negative',
+        'polite_nonpast_affirmative', 'polite_nonpast_negative', 'polite_past_affirmative', 'polite_past_negative',
+        'te_form', 'progressive', 'potential', 'passive', 'causative', 'causative_passive',
+        'volitional', 'imperative', 'conditional', 'desiderative', 'stem_and_non_finite'
+    ]),
+    KO:Object.freeze([
+        'dictionary_form_and_stem', 'informal_polite_present', 'informal_polite_past', 'informal_polite_future',
+        'formal_present', 'formal_past', 'formal_future', 'negative_forms',
+        'imperative', 'propositive', 'conditional', 'connective_and_non_finite', 'honorific'
+    ]),
+    RU:Object.freeze([
+        'present', 'past', 'future_simple', 'future_compound', 'imperative', 'conditional_subjunctive',
+        'infinitive', 'aspect_pair', 'active_present_participle', 'active_past_participle',
+        'passive_present_participle', 'passive_past_participle',
+        'present_adverbial_participle', 'past_adverbial_participle'
+    ]),
+    AR:Object.freeze([
+        'perfect_active', 'imperfect_indicative_active', 'imperfect_subjunctive_active',
+        'imperfect_jussive_active', 'imperative', 'prohibitive',
+        'perfect_passive', 'imperfect_passive', 'active_participle', 'passive_participle',
+        'verbal_noun', 'person_gender_number_paradigm'
+    ]),
+    SW:Object.freeze([
+        'infinitive', 'present_na', 'habitual_hu', 'situational_ki', 'past_li', 'perfect_me',
+        'narrative_ka', 'future_ta', 'conditional_nge', 'counterfactual_ngali',
+        'subjunctive', 'imperative', 'negative_present', 'negative_past',
+        'negative_future', 'negative_perfect', 'negative_subjunctive', 'relative_forms'
+    ])
+});
+
 const textArray = (maxItems = 8) => ({ type:'array', items:{ type:'string' }, maxItems });
 const bilingualLists = (maxItems = 8) => ({
     type:'object', additionalProperties:false,
@@ -85,11 +181,14 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
         },
         isVerb:{ type:'boolean' },
         conjugationGroups:{
-            type:'array', maxItems:24,
+            type:'array', maxItems:32,
             items:{
                 type:'object', additionalProperties:false,
-                properties:{ label:{ type:'string' }, forms:textArray(24), note:{ type:'string' } },
-                required:['label', 'forms', 'note']
+                properties:{
+                    label:{ type:'string' }, forms:textArray(32), note:{ type:'string' },
+                    coverageKeys:textArray(8)
+                },
+                required:['label', 'forms', 'note', 'coverageKeys']
             }
         },
         definitions:bilingualLists(6),
@@ -267,6 +366,23 @@ function normalizeMeaningLabel(value, index) {
     return cleaned.charAt(0).toLocaleUpperCase() + cleaned.slice(1);
 }
 
+function normalizePartOfSpeech(value, query) {
+    const cleaned = cleanText(value).replace(/\s*[,/|]\s*/g, ' · ').replace(/\s*·\s*/g, ' · ');
+    if (!cleaned || !/\s/u.test(normalizeDictionaryQuery(query))) return cleaned;
+    // A multiword lexical entry is a phrase or compound, not a single bare
+    // word-class label. This deterministic guard fixes generic classifications
+    // such as "escape valve" => "Noun" without guessing a different head class.
+    const phraseLabels = {
+        noun:'Noun phrase',
+        verb:'Verb phrase',
+        adjective:'Adjective phrase',
+        adverb:'Adverb phrase',
+        preposition:'Prepositional phrase',
+        interjection:'Interjection phrase'
+    };
+    return phraseLabels[cleaned.toLocaleLowerCase('en')] || cleaned;
+}
+
 function normalizeBilingual(value) {
     return {
         sourceLang:cleanTextArray(value?.sourceLang),
@@ -345,13 +461,14 @@ function normalizeConjugations(result) {
     const seen = new Set();
     return groups.map(group => ({
         label:cleanText(group?.label || group?.tense),
-        forms:cleanTextArray(group?.forms, 24),
-        note:cleanText(group?.note)
+        forms:cleanTextArray(group?.forms, 32),
+        note:cleanText(group?.note),
+        coverageKeys:cleanTextArray(group?.coverageKeys, 8)
     })).filter(group => {
         const key = group.label.toLocaleLowerCase('en');
         if (!key || !group.forms.length || seen.has(key)) return false;
         seen.add(key); return true;
-    }).slice(0, 24);
+    }).slice(0, 32);
 }
 
 function conjugationObject(groups) {
@@ -431,12 +548,15 @@ export function normalizePreviewResult(rawResult, context) {
     const normalized = {
         ...base,
         languageMismatch:false,
-        partOfSpeech:cleanText(result.partOfSpeech),
+        partOfSpeech:normalizePartOfSpeech(result.partOfSpeech, context.query),
         formality,
         mainTranslation:cleanTextArray(result.mainTranslation, 4),
         pronunciationGuide:cleanText(result.pronunciationGuide),
         previewMeaning:{
-            partOfSpeech:cleanText(meaning.partOfSpeech) || cleanText(result.partOfSpeech),
+            partOfSpeech:normalizePartOfSpeech(
+                meaning.partOfSpeech || result.partOfSpeech,
+                context.query
+            ),
             register:normalizeRegister(meaning.register, formality),
             sourceDefinition:cleanText(meaning.sourceDefinition),
             targetDefinition:cleanText(meaning.targetDefinition)
@@ -507,6 +627,7 @@ export function previewQualityIssues(result, context) {
 export function normalizeTranslationResult(rawResult, context) {
     const result = clone(rawResult) || {};
     const requested = cleanCode(context.fromLang);
+    const normalizedQuery = normalizeDictionaryQuery(context.query);
     const validation = applyKnownLanguageMembership(
         normalizedValidation(result.sourceLanguageValidation, requested),
         context
@@ -522,7 +643,9 @@ export function normalizeTranslationResult(rawResult, context) {
     }
 
     const formality = normalizeRegister(result.formality);
-    const conjugationGroups = normalizeConjugations(result);
+    const partOfSpeech = normalizePartOfSpeech(result.partOfSpeech, context.query);
+    const isVerb = result.isVerb === true || /\bverb\b/iu.test(partOfSpeech);
+    const conjugationGroups = normalizeConjugations({ ...result, isVerb });
     const normalized = {
         detectedSourceLang:cleanCode(result.detectedSourceLang) || requested,
         sourceLanguageValidation:validation,
@@ -530,13 +653,13 @@ export function normalizeTranslationResult(rawResult, context) {
         suggestedCorrection:cleanText(result.suggestedCorrection),
         extractedText:cleanText(result.extractedText),
         languageMismatch:false,
-        partOfSpeech:cleanText(result.partOfSpeech),
+        partOfSpeech,
         formality,
         learningMetadata:normalizeLearningMetadata(result.learningMetadata, context.definitionsOnly === true),
         mainTranslation:cleanTextArray(result.mainTranslation, 8),
         pronunciationGuide:cleanText(result.pronunciationGuide),
         etymology:{ sourceLang:cleanText(result.etymology?.sourceLang), targetLang:cleanText(result.etymology?.targetLang) },
-        isVerb:result.isVerb === true,
+        isVerb,
         conjugationGroups,
         conjugations:conjugationObject(conjugationGroups),
         definitions:normalizeBilingual(result.definitions),
@@ -605,6 +728,21 @@ function bilingualHasContent(value, definitionsOnly, allowEmpty = false) {
     return definitionsOnly || allowEmpty || value.targetLang.some(hasText);
 }
 
+export function requiredConjugationCoverage(languageCode) {
+    return [...(CONJUGATION_COVERAGE[cleanCode(languageCode)] || [])];
+}
+
+export function conjugationCoverageIssues(result, context) {
+    if (result?.isVerb !== true) return [];
+    const groups = Array.isArray(result.conjugationGroups) ? result.conjugationGroups : [];
+    if (!groups.length) return ['missing language-specific conjugations'];
+    const required = requiredConjugationCoverage(context.fromLang);
+    const covered = new Set(groups.flatMap(group => cleanTextArray(group?.coverageKeys, 8)));
+    const missing = required.filter(key => !covered.has(key));
+    if (missing.length) return [`incomplete conjugation coverage: ${missing.join(', ')}`];
+    return [];
+}
+
 export function coreQualityIssues(result, context) {
     const issues = [];
     if (!result || typeof result !== 'object') return ['empty result'];
@@ -618,6 +756,9 @@ export function coreQualityIssues(result, context) {
     const definitionsOnly = context.definitionsOnly === true;
     if (!result.wordExists) issues.push('accepted entry marked nonexistent');
     if (!hasText(result.partOfSpeech)) issues.push('missing part of speech');
+    if (/\bverb\b/iu.test(result.partOfSpeech || '') && result.isVerb !== true) {
+        issues.push('verb classification contradicts isVerb');
+    }
     if (!REGISTER_VALUES.includes(result.formality)) issues.push('missing entry register');
     if (!CEFR_LEVELS.includes(result.learningMetadata?.cefrLevel)
         || !FREQUENCY_BANDS.includes(result.learningMetadata?.frequencyBand)
@@ -644,7 +785,7 @@ export function coreQualityIssues(result, context) {
     if (!Array.isArray(result.regionalVariants) || !Array.isArray(result.wordFamily) || !Array.isArray(result.minimalPairs)) {
         issues.push('missing optional-section containers');
     }
-    if (result.isVerb && !result.conjugationGroups?.length) issues.push('missing language-specific conjugations');
+    issues.push(...conjugationCoverageIssues(result, context));
     if (!Array.isArray(result.contexts) || !result.contexts.length || result.contexts.some(contextItem => !hasText(contextItem.contextName))) {
         issues.push('missing contexts');
     }
@@ -720,7 +861,7 @@ First decide whether the exact input is genuinely established in requested sourc
 
 Validation fields must be internally consistent. validLanguages is supporting evidence and need not be exhaustive. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish. If existsInRequestedLanguage=false, leave partOfSpeech, formality, mainTranslation, pronunciationGuide and every previewMeaning field empty. Do not translate a source-language mismatch.
 
-For an accepted entry, return every established part of speech in partOfSpeech, one concise pronunciation guide, ${definitionsOnly ? 'no translation' : `one to four useful ${toName} translations`}, and one concise source-language definition for the most common sense. ${definitionsOnly ? 'Keep targetDefinition empty.' : `Give a faithful ${toName} targetDefinition.`} Include the exact part of speech and register for that meaning.
+For an accepted entry, return every established part of speech in partOfSpeech, one concise pronunciation guide, ${definitionsOnly ? 'no translation' : `one to four useful ${toName} translations`}, and one concise source-language definition for the most common sense. Use concise English grammatical labels. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. ${definitionsOnly ? 'Keep targetDefinition empty.' : `Give a faithful ${toName} targetDefinition.`} Include the exact part of speech and register for that meaning.
 
 Write sourceDefinition in ${fromName}. ${definitionsOnly ? 'Keep mainTranslation and targetDefinition empty.' : `Write mainTranslation and targetDefinition in ${toName}.`} Use only these language codes: ${Object.keys(LANGUAGES).join(', ')}. Return strict JSON matching the schema.${repairInstruction}`;
     return {
@@ -738,6 +879,7 @@ export function buildCoreRequest(context, { repairSource = null } = {}) {
     const fromName = LANGUAGES[cleanCode(context.fromLang)];
     const toName = LANGUAGES[cleanCode(context.toLang)];
     const definitionsOnly = context.definitionsOnly === true;
+    const conjugationCoverage = requiredConjugationCoverage(context.fromLang);
     const repairInstruction = repairSource
         ? `\nRepair the supplied draft. Correct these production-gate issues: ${repairSource.issues.join('; ')}. Do not repeat the defects.\nDraft JSON:\n${JSON.stringify(repairSource.result)}` : '';
     const system = `You are Qelumi's conservative multilingual dictionary engine. Analyse the exact input, never a corrected substitute.
@@ -746,13 +888,19 @@ First decide only what production needs: whether the exact input is genuinely es
 
 Validation fields must be internally consistent. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish that is not valid in any supported language. If existsInRequestedLanguage=false, return every linguistic field empty: no translation, definition, etymology, pronunciation, meaning, context, conjugation, phrase, synonym, family, or minimal pair. The server will enforce this rule again.
 
-For an accepted entry, provide a compact but complete core dictionary result. Put register on every distinct meaning because one entry may mix neutral, informal, slang, technical, or other senses. Each meaning label must be a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
+For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must classify the exact whole input using concise English grammatical labels so the interface remains consistent. For a multiword entry, use a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Adjective phrase, Idiomatic expression, Clause or Sentence; never reduce "escape valve" to the bare single-word label "Noun". When established senses span word classes, list all of them, for example "Noun · Verb". Set isVerb=true whenever at least one established sense is verbal, even if the entry is also a noun or adjective.
+
+Put register on every distinct meaning because one entry may mix neutral, informal, slang, technical, or other senses. Each meaning label must be a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
 
 LEARNING METADATA: estimate the entry's practical CEFR vocabulary level as A1, A2, B1, B2, C1 or C2; use Unclassified for proper names, specialist terminology or expressions that cannot responsibly be mapped. Classify frequency as Very common, Common, Less common, Rare or Specialized, and modality as Spoken, Written or Both. sourceNote must briefly explain the level, frequency and typical use in ${fromName}. ${definitionsOnly ? 'Leave targetNote empty.' : `targetNote must faithfully explain the same learning guidance in ${toName}.`} Treat these as learner guidance, not an official certification claim.
 
 ETYMOLOGY IS ABOUT THE SOURCE ENTRY, NEVER ITS TRANSLATION. Both etymology.sourceLang and etymology.targetLang must describe the origin and historical development of the exact source entry "${context.query}" in ${fromName}; neither field may switch to the origin of a destination-language equivalent. Write sourceLang entirely in ${fromName}. ${definitionsOnly ? 'Leave targetLang empty.' : `Write targetLang entirely in ${toName} as a faithful translation of the same etymological facts.`} When reliable information exists, give two to four concise but informative sentences covering the relevant roots or formation, original sense, route into the language, and later development or expression history. For an expression, explain the expression as a whole rather than etymologising an unrelated translated phrase. If evidence is uncertain or genuinely unavailable, state that explicitly and do not invent a story.
 
-If the entry is a verb, make conjugationGroups a comprehensive practical inventory of the standard modern moods, tenses, aspects and non-finite forms that naturally exist in ${fromName}. Do not omit a standard tense merely to keep the answer short, and do not force universal English/French labels onto another language. Include person or pronoun labels where the language normally uses them. Recognised literary, historical or rare forms may be included only when clearly labelled in note. Keep repeated auxiliary constructions concise but accurate. If the entry is not a verb, return [].
+If the entry is a verb, make conjugationGroups a comprehensive practical inventory of the standard modern moods, tenses, aspects and non-finite forms that naturally exist in ${fromName}. Do not omit a standard form merely to keep the answer short, and do not force universal English/French tense concepts onto another language. For languages without inflectional tense, show their natural aspect, polarity, politeness and verb-form patterns instead. Include every person/pronoun form where the language normally distinguishes them. Recognised literary, historical or rare forms may be included only when clearly labelled in note. Keep repeated auxiliary constructions concise but accurate.
+
+CONJUGATION COVERAGE CONTRACT: when isVerb=true, the union of conjugationGroups.coverageKeys must contain every one of these exact machine keys:
+${conjugationCoverage.join(', ')}
+coverageKeys are validation metadata and are not user-facing labels. Put each key on the group that actually supplies those forms; combine related keys in one group only when the displayed forms remain clear. If the entry is not a verb, return an empty conjugationGroups array.
 
 Contexts contain names and meaning indexes only, with empty examples arrays; examples are requested separately. Do not generate quiz distractors.
 
@@ -764,7 +912,66 @@ Use supported language codes only: ${Object.keys(LANGUAGES).join(', ')}. Return 
         systemInstruction:{ parts:[{ text:system }] },
         generationConfig:{
             responseMimeType:'application/json', responseJsonSchema:CORE_RESPONSE_SCHEMA,
-            maxOutputTokens:12288
+            maxOutputTokens:16384
+        }
+    };
+}
+
+function conjugationResponseSchema(context) {
+    const coverageKeys = requiredConjugationCoverage(context.fromLang);
+    return {
+        type:'object',
+        additionalProperties:false,
+        properties:{
+            conjugationGroups:{
+                type:'array',
+                minItems:1,
+                maxItems:32,
+                items:{
+                    type:'object',
+                    additionalProperties:false,
+                    properties:{
+                        label:{ type:'string' },
+                        forms:textArray(32),
+                        note:{ type:'string' },
+                        coverageKeys:{
+                            type:'array',
+                            minItems:1,
+                            maxItems:8,
+                            items:{ type:'string', enum:coverageKeys }
+                        }
+                    },
+                    required:['label', 'forms', 'note', 'coverageKeys']
+                }
+            }
+        },
+        required:['conjugationGroups']
+    };
+}
+
+export function buildConjugationRepairRequest(context, coreResult, issues = []) {
+    const fromName = LANGUAGES[cleanCode(context.fromLang)];
+    const required = requiredConjugationCoverage(context.fromLang);
+    const system = `You are Qelumi's specialist ${fromName} verb-paradigm repair engine. Return only corrected conjugationGroups for the exact source entry. The entry has already been accepted in ${fromName} and has at least one verbal sense.
+
+Supply a comprehensive but concise source-language paradigm. Use natural ${fromName} labels. Include all person, number, gender, politeness or polarity contrasts that the language normally distinguishes. For languages without inflectional tense, supply their genuine aspect, polarity, politeness and verb-form patterns instead of inventing European-style tenses. Mark genuinely literary, historical or rare forms in note.
+
+The union of coverageKeys must contain every exact key below, and every key must describe forms actually shown by its group:
+${required.join(', ')}
+
+coverageKeys are machine validation labels, not headings. Do not translate the entry and do not return any other dictionary fields. Return strict JSON matching the schema.`;
+    return {
+        contents:[{
+            role:'user',
+            parts:[{
+                text:`Exact source entry: ${context.query}\nSource language: ${fromName} (${context.fromLang})\nGrammatical classification: ${coreResult?.partOfSpeech || 'Verb'}\nDetected defects: ${issues.join('; ') || 'coverage incomplete'}\nCurrent conjugation groups:\n${JSON.stringify(coreResult?.conjugationGroups || [])}`
+            }]
+        }],
+        systemInstruction:{ parts:[{ text:system }] },
+        generationConfig:{
+            responseMimeType:'application/json',
+            responseJsonSchema:conjugationResponseSchema(context),
+            maxOutputTokens:10000
         }
     };
 }
@@ -884,8 +1091,8 @@ export function isComplexResponseSchema(schema) {
     if (!schema) return false;
     const complexity = schemaComplexity(schema);
     // Gemini explicitly documents that very large/deep schemas may be rejected.
-    // Qelumi's core dictionary contract currently has 69 properties; proactively
-    // use JSON mode plus server validation instead of paying for a known 400.
+    // Qelumi's core dictionary contract is well above the conservative complexity
+    // boundary, so use JSON mode plus server validation instead of paying for a known 400.
     return complexity.properties > 60 || complexity.nodes > 140 || complexity.depth > 8
         || JSON.stringify(schema).length > 12_000;
 }
@@ -1334,7 +1541,38 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     async function generateCore(context, uid, prior = null) {
         const totalStart = performance.now();
         let primary; let primaryParsed; let primaryError; let fallbackReason = '';
+        let conjugationRepair;
         const contradictionsBefore = [];
+        const onlyConjugationIssues = issues => issues.length > 0 && issues.every(issue =>
+            issue === 'missing language-specific conjugations'
+            || issue.startsWith('incomplete conjugation coverage:')
+        );
+        const repairConjugations = async (candidate, candidateIssues) => {
+            if (!candidate?.isVerb || !onlyConjugationIssues(candidateIssues)) {
+                return { result:candidate, issues:candidateIssues, repaired:false };
+            }
+            try {
+                conjugationRepair = await modelJSON({
+                    model:FALLBACK_MODEL,
+                    thinkingLevel:FALLBACK_THINKING,
+                    body:buildConjugationRepairRequest(context, candidate, candidateIssues),
+                    timeoutMs:fallbackTimeoutMs,
+                    operation:'translation_conjugation_repair',
+                    uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                const repaired = normalizeTranslationResult({
+                    ...candidate,
+                    isVerb:true,
+                    conjugationGroups:conjugationRepair.result?.conjugationGroups
+                }, context);
+                const repairedIssues = coreQualityIssues(repaired, context);
+                return { result:repaired, issues:repairedIssues, repaired:repairedIssues.length === 0 };
+            } catch (error) {
+                console.warn('Focused conjugation repair failed; the complete fallback will be used.', error.message);
+                return { result:candidate, issues:candidateIssues, repaired:false };
+            }
+        };
         try {
             primary = await modelJSON({
                 model:PRIMARY_MODEL, thinkingLevel:PRIMARY_THINKING,
@@ -1375,6 +1613,13 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             }
         }
 
+        if (result && issues.length && !primaryError) {
+            const repaired = await repairConjugations(result, issues);
+            result = repaired.result;
+            issues = repaired.issues;
+            if (repaired.repaired) fallbackReason = 'conjugation_coverage_repair';
+        }
+
         if (!result || issues.length || primaryError) {
             fallbackReason = fallbackReason || (issues.length ? `core_quality:${issues.join('|')}` : 'primary_parse_or_schema_failure');
             fallback = await modelJSON({
@@ -1387,14 +1632,27 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             issues = coreQualityIssues(result, context);
         }
 
+        if (result && issues.length) {
+            const repaired = await repairConjugations(result, issues);
+            result = repaired.result;
+            issues = repaired.issues;
+            if (repaired.repaired) {
+                fallbackReason = fallbackReason
+                    ? `${fallbackReason}|conjugation_coverage_repair`
+                    : 'conjugation_coverage_repair';
+            }
+        }
+
         if (issues.length) {
             const error = new Error(`The linguistic response was incomplete: ${issues.join(', ')}.`);
             error.status = 502; error.code = 'MODEL_SCHEMA_INCOMPLETE'; throw error;
         }
         if (prior) result = mergeContextExamples(result, prior);
         result = await saveCachedResult(context, result, {
-            model:primary?.model || fallback?.model,
-            fallbackModel:fallback?.model || '', fallbackUsed:!!fallback, fallbackReason
+            model:primary?.model || fallback?.model || conjugationRepair?.model,
+            fallbackModel:fallback?.model || conjugationRepair?.model || '',
+            fallbackUsed:!!fallback || !!conjugationRepair,
+            fallbackReason
         });
         return {
             result,
@@ -1403,10 +1661,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 schemaVersion:DICTIONARY_SCHEMA_VERSION,
                 primaryModel:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING,
                 fallbackModel:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING,
-                fallbackUsed:!!fallback, fallbackReason,
+                fallbackUsed:!!fallback || !!conjugationRepair, fallbackReason,
                 contextsReady:contextsAreComplete(result, context),
                 latencyMs:Math.round(performance.now() - totalStart),
-                modelCalls:[primary, fallback].filter(Boolean).map(call => ({
+                modelCalls:[primary, fallback, conjugationRepair].filter(Boolean).map(call => ({
                     model:call.model, thinkingLevel:call.thinkingLevel, latencyMs:call.latencyMs,
                     schemaFallbackUsed:call.schemaFallbackUsed === true,
                     compatibilityMode:call.compatibilityMode, compatibilityRetries:call.compatibilityRetries,
@@ -1430,8 +1688,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             'invalid learning metadata', 'missing source learning note', 'missing target learning note'
         ]);
         // Learning metadata was introduced in schema v12. A structurally sound older
-        // entry may still render immediately while its background refresh adds that
-        // guidance; a current-schema entry must pass the complete v12 gate.
+        // non-verb may still render immediately while its background refresh upgrades
+        // it. Missing schema-v13 conjugation coverage remains blocking for verbs.
         const cacheBlockingIssues = needsSchemaRefresh
             ? cachedIssues.filter(issue => !upgradeOnlyIssues.has(issue))
             : cachedIssues;

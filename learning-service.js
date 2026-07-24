@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import { LANGUAGES } from './translation-service.js';
 
 export const LEARNING_FEATURES = Object.freeze([
@@ -317,28 +316,6 @@ export function buildLearningRequest(feature, input = {}) {
     if (!text) throw Object.assign(new Error('Enter a sentence or paragraph to review.'), { status:400 });
     const system = `You are Qelumi Writing & Tone Coach for ${writing.name}. Correct grammar, spelling, punctuation and unnatural phrasing while preserving meaning. Supply natural, formal, neutral and informal versions; where a register would be inappropriate, still provide the closest safe equivalent and explain it. Each change must teach a concrete rule or usage point. Write all explanations in ${writing.name}. Return strict JSON only.`;
     return request(system, `Text to review:\n${text}`, WRITING_SCHEMA, { maxOutputTokens:4_500 });
-}
-
-export function correctionDocumentId(uid, query, fromLang, toLang, section, createdAt = Date.now()) {
-    return crypto.createHash('sha256')
-        .update(`${uid}|${cleanCode(fromLang)}|${cleanCode(toLang)}|${cleanText(query, 300).toLocaleLowerCase()}|${cleanText(section, 80)}|${createdAt}`)
-        .digest('hex');
-}
-
-export function sanitizeCorrectionValue(value, maximum = 20_000) {
-    if (value == null) return null;
-    if (typeof value === 'string') {
-        const trimmed = value.trim();
-        if (trimmed.length > maximum) {
-            throw Object.assign(new Error('The proposed correction is too large.'), { status:413 });
-        }
-        return trimmed;
-    }
-    const serialised = JSON.stringify(value);
-    if (serialised.length > maximum) {
-        throw Object.assign(new Error('The proposed correction is too large.'), { status:413 });
-    }
-    return JSON.parse(serialised);
 }
 
 export function percentile(values, requestedPercentile) {
