@@ -16,7 +16,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.2.0';
+const BACKEND_VERSION = '4.3.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -46,7 +46,14 @@ const feedbackCollection = () => db.collection('artifacts').doc(APP_ID).collecti
 const translationSearchCollection = () => db.collection('admin_metrics').doc('translation_searches').collection('items');
 const administratorRolesCollection = () => db.collection('admin_roles');
 const administratorAuditCollection = () => db.collection('admin_role_audit');
+const qelumiProfilesCollection = () => db.collection('qelumi_profiles');
+const qelumiUsernamesCollection = () => db.collection('qelumi_usernames');
+const liveConversationsCollection = () => db.collection('live_conversations');
 const administratorRoleDocumentId = uid => crypto.createHash('sha256').update(String(uid || '')).digest('hex');
+const stableHash = value => crypto.createHash('sha256').update(String(value || '')).digest('hex');
+const normalizeUsername = value => String(value || '').normalize('NFKC').trim().toLocaleLowerCase('en');
+const reservedUsernames = new Set(['admin','administrator','qelumi','support','feedback','system','official','moderator']);
+const privateInviteAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const timestampMillis = value => value?.toMillis?.() || Number(value) || 0;
 const htmlEscape = value => String(value ?? '').replace(/[&<>"']/g, character => ({
     '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
@@ -126,6 +133,13 @@ async function requireUser(req, res, next) {
     }
 }
 
+function requireRegisteredUser(req, res, next) {
+    if (req.user?.firebase?.sign_in_provider === 'anonymous') {
+        return res.status(403).json({ error:{ message:'Sign in with a registered account to use connected conversations.' } });
+    }
+    next();
+}
+
 function requireAdmin(req, res, next) {
     if (req.user?.uid !== ADMIN_UID && req.user?.admin !== true) return res.status(403).json({ error:{ message:'Administrator access required.' } });
     next();
@@ -160,6 +174,54 @@ const publicAdministratorRecord = userRecord => ({
     admin:userRecord.uid === ADMIN_UID || userRecord.customClaims?.admin === true,
     primary:userRecord.uid === ADMIN_UID
 });
+
+function cleanUsername(value) {
+    const username = String(value || '').normalize('NFKC').trim();
+    if (!/^[\p{L}\p{N}][\p{L}\p{N}._-]{2,23}$/u.test(username)) {
+        const error = new Error('Use 3–24 letters or numbers, with optional dots, underscores or hyphens.');
+        error.status = 400;
+        throw error;
+    }
+    const normalized = normalizeUsername(username);
+    if (reservedUsernames.has(normalized)) {
+        const error = new Error('That username is reserved. Please choose another.');
+        error.status = 409;
+        throw error;
+    }
+    return { username, normalized, documentId:stableHash(normalized) };
+}
+
+const participantList = value => Array.isArray(value) ? value.filter(item => item?.uid) : [];
+const publicLiveRoom = (snapshotOrData, id = '') => {
+    const data = typeof snapshotOrData?.data === 'function' ? snapshotOrData.data() : (snapshotOrData || {});
+    return {
+        id:typeof snapshotOrData?.id === 'string' ? snapshotOrData.id : id,
+        status:String(data.status || 'waiting'),
+        languageA:String(data.languageA || ''),
+        languageB:String(data.languageB || ''),
+        inviteCode:String(data.inviteCode || ''),
+        memberUids:Array.isArray(data.memberUids) ? data.memberUids : [],
+        participants:participantList(data.participants).map(item => ({
+            uid:String(item.uid || ''), username:String(item.username || ''), language:String(item.language || '')
+        })),
+        createdAtMs:Number(data.createdAtMs || timestampMillis(data.createdAt)),
+        updatedAtMs:Number(data.updatedAtMs || timestampMillis(data.updatedAt))
+    };
+};
+
+function randomInviteCode(length = 8) {
+    const bytes = crypto.randomBytes(length);
+    return Array.from(bytes, byte => privateInviteAlphabet[byte % privateInviteAlphabet.length]).join('');
+}
+
+async function uniqueInviteCode() {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const code = randomInviteCode();
+        const match = await liveConversationsCollection().where('inviteCode', '==', code).limit(1).get();
+        if (match.empty) return code;
+    }
+    throw Object.assign(new Error('A private invite code could not be created. Please try again.'), { status:503 });
+}
 
 async function recordUsage(uid, operation, metadata = {}) {
     const day = new Date().toISOString().slice(0, 10); const ref = db.doc(`admin_metrics/api_usage/days/${day}`);
@@ -292,6 +354,148 @@ async function runLearningFeature(feature, input, uid) {
     };
 }
 
+function liveTranslationRequest(text, sourceLang, targetLang) {
+    const targetName = LANGUAGES[targetLang];
+    const sourceInstruction = sourceLang === 'AUTO'
+        ? `Detect the source language and return its supported ISO code from: ${Object.keys(LANGUAGES).join(', ')}.`
+        : `The source language is ${LANGUAGES[sourceLang]} (${sourceLang}). Return ${sourceLang} as sourceLang.`;
+    return {
+        systemInstruction:{ parts:[{ text:`You are Qelumi's live conversation interpreter. ${sourceInstruction} Translate the complete spoken message naturally into ${targetName} (${targetLang}). Preserve meaning, tone, politeness, names, numbers and register. Do not explain, censor, expand or answer the message. Return strict JSON only.` }] },
+        contents:[{ role:'user', parts:[{ text:`Spoken message:\n${text}` }] }],
+        generationConfig:{
+            responseMimeType:'application/json',
+            maxOutputTokens:2048,
+            responseSchema:{
+                type:'OBJECT',
+                properties:{
+                    sourceLang:{ type:'STRING', enum:Object.keys(LANGUAGES) },
+                    translatedText:{ type:'STRING' }
+                },
+                required:['sourceLang','translatedText']
+            }
+        }
+    };
+}
+
+async function translateLiveText({ text, sourceLang, targetLang }, uid) {
+    const cleanMessage = String(text || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').slice(0, 1500);
+    const source = String(sourceLang || 'AUTO').trim().toUpperCase();
+    const target = String(targetLang || '').trim().toUpperCase();
+    if (!cleanMessage) throw Object.assign(new Error('A spoken or typed message is required.'), { status:400 });
+    if (source !== 'AUTO' && !LANGUAGES[source]) throw Object.assign(new Error('Unsupported source language.'), { status:400 });
+    if (!LANGUAGES[target]) throw Object.assign(new Error('Unsupported destination language.'), { status:400 });
+    if (source !== 'AUTO' && source === target) throw Object.assign(new Error('Choose two different languages.'), { status:400 });
+    const body = liveTranslationRequest(cleanMessage, source, target);
+    let data; let result; let model = PRIMARY_MODEL; let thinkingLevel = PRIMARY_THINKING;
+    let operation = 'live_translation_primary'; let started = performance.now(); let fallbackUsed = false;
+    try {
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:20_000 });
+        result = parseGeminiJSON(data);
+        if (!LANGUAGES[result?.sourceLang] || !String(result?.translatedText || '').trim()) throw new Error('The live translation was incomplete.');
+    } catch (primaryError) {
+        recordUsage(uid, `${operation}_error`, {
+            fromLang:source, toLang:target, model, thinkingLevel,
+            latencyMs:Math.max(0, Math.round(performance.now() - started)),
+            errorCode:primaryError.code || 'REQUEST_FAILED'
+        }).catch(() => {});
+        fallbackUsed = true; model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
+        operation = 'live_translation_fallback'; started = performance.now();
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:30_000 });
+        result = parseGeminiJSON(data);
+    }
+    const detectedSource = source === 'AUTO' ? String(result?.sourceLang || '').toUpperCase() : source;
+    const translatedText = String(result?.translatedText || '').trim();
+    if (!LANGUAGES[detectedSource] || !translatedText) {
+        throw Object.assign(new Error('The live translation was incomplete. Please try again.'), { status:502 });
+    }
+    const usage = {
+        ...measuredGeminiUsage(data, started, model, thinkingLevel),
+        fromLang:detectedSource, toLang:target, feature:'live_translation'
+    };
+    recordUsage(uid, operation, usage).catch(() => {});
+    return {
+        sourceLang:detectedSource, targetLang:target, sourceText:cleanMessage, translatedText,
+        meta:{model, thinkingLevel, fallbackUsed, latencyMs:usage.latencyMs}
+    };
+}
+
+function parseLiveAudioData(value) {
+    const match = String(value || '').match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/);
+    if (!match) throw Object.assign(new Error('The recorded audio format is invalid.'), { status:400 });
+    const aliases = {
+        'audio/x-m4a':'audio/mp4', 'audio/mp4a-latm':'audio/mp4',
+        'audio/x-wav':'audio/wav', 'audio/wave':'audio/wav'
+    };
+    const requestedMimeType = String(match[1] || '').toLowerCase().trim();
+    const mimeType = aliases[requestedMimeType] || requestedMimeType;
+    const accepted = mimeType.startsWith('audio/') || mimeType === 'video/webm';
+    if (!accepted) throw Object.assign(new Error('The uploaded media format is not supported.'), { status:415 });
+    const data = match[2].replace(/\s+/g, '');
+    const byteLength = Buffer.from(data, 'base64').length;
+    if (byteLength < 32) throw Object.assign(new Error('No usable audio was captured.'), { status:400 });
+    if (byteLength > 6 * 1024 * 1024) {
+        throw Object.assign(new Error('That recording is too large. Record no more than 45 seconds at a time.'), { status:413 });
+    }
+    return {mimeType, data};
+}
+
+function liveTranscriptionRequest(audio) {
+    return {
+        systemInstruction:{ parts:[{ text:`You are Qelumi's speech transcription engine. Detect the spoken language from these supported codes: ${Object.keys(LANGUAGES).join(', ')}. Transcribe only clearly audible speech faithfully in its original language and writing system. Preserve names, numbers, fillers and sentence boundaries. Never translate, answer, explain or invent inaudible words. Return strict JSON only.` }] },
+        contents:[{ role:'user', parts:[
+            { inlineData:{ mimeType:audio.mimeType, data:audio.data } },
+            { text:'Detect the spoken language and transcribe this recording.' }
+        ] }],
+        generationConfig:{
+            responseMimeType:'application/json',
+            maxOutputTokens:4096,
+            responseSchema:{
+                type:'OBJECT',
+                properties:{
+                    sourceLang:{ type:'STRING', enum:Object.keys(LANGUAGES) },
+                    transcript:{ type:'STRING' }
+                },
+                required:['sourceLang','transcript']
+            }
+        }
+    };
+}
+
+async function transcribeLiveAudio(audioData, uid) {
+    const audio = parseLiveAudioData(audioData);
+    const body = liveTranscriptionRequest(audio);
+    let data; let result; let model = PRIMARY_MODEL; let thinkingLevel = PRIMARY_THINKING;
+    let operation = 'live_transcription_primary'; let started = performance.now(); let fallbackUsed = false;
+    try {
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:30_000 });
+        result = parseGeminiJSON(data);
+        if (!LANGUAGES[result?.sourceLang] || !String(result?.transcript || '').trim()) {
+            throw new Error('No clear speech was recognised in that recording.');
+        }
+    } catch (primaryError) {
+        recordUsage(uid, `${operation}_error`, {
+            model, thinkingLevel,
+            latencyMs:Math.max(0, Math.round(performance.now() - started)),
+            errorCode:primaryError.code || 'REQUEST_FAILED'
+        }).catch(() => {});
+        fallbackUsed = true; model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
+        operation = 'live_transcription_fallback'; started = performance.now();
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:40_000 });
+        result = parseGeminiJSON(data);
+    }
+    const sourceLang = String(result?.sourceLang || '').toUpperCase();
+    const transcript = String(result?.transcript || '').trim();
+    if (!LANGUAGES[sourceLang] || !transcript) {
+        throw Object.assign(new Error('No clear speech was recognised. Please try again closer to the microphone.'), { status:422 });
+    }
+    const usage = {
+        ...measuredGeminiUsage(data, started, model, thinkingLevel),
+        fromLang:sourceLang, toLang:'', feature:'live_transcription'
+    };
+    recordUsage(uid, operation, usage).catch(() => {});
+    return {sourceLang, transcript, meta:{model, thinkingLevel, fallbackUsed, latencyMs:usage.latencyMs}};
+}
+
 function translationContext(body) {
     const query = String(body?.query || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').slice(0, 300);
     const fromLang = String(body?.fromLang || '').trim().toUpperCase();
@@ -366,7 +570,9 @@ app.get('/health', (_req, res) => res.json({
     learningFeatures:{
         contextLens:true, mistakes:true, shadowing:true, conversations:true,
         stories:true, cefr:true, writingCoach:true,
-        mobileBridge:true, performanceDashboard:true
+        mobileBridge:true, performanceDashboard:true,
+        liveTranscript:true, automaticSpeechDetection:true,
+        localConversation:true, connectedConversation:true
     },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     renderCache:{
@@ -392,6 +598,209 @@ app.post('/api/auth/email-exists', rateLimit({ windowMs:15 * 60_000, max:20, key
         res.status(500).json({ error:{ message:'Unable to check that account.' } });
     }
 });
+
+app.get('/api/profile', requireUser, async (req, res) => {
+    const profile = await qelumiProfilesCollection().doc(req.user.uid).get();
+    res.json({ profile:{ username:profile.exists ? String(profile.data()?.username || '') : '' } });
+});
+
+app.post('/api/profile', requireUser, requireRegisteredUser,
+    rateLimit({ windowMs:60 * 60_000, max:12, key:req => `profile:${req.user.uid}` }), async (req, res) => {
+        try {
+            const next = cleanUsername(req.body?.username);
+            const profileReference = qelumiProfilesCollection().doc(req.user.uid);
+            const usernameReference = qelumiUsernamesCollection().doc(next.documentId);
+            await db.runTransaction(async transaction => {
+                const [profileSnapshot, usernameSnapshot] = await Promise.all([
+                    transaction.get(profileReference), transaction.get(usernameReference)
+                ]);
+                if (usernameSnapshot.exists && usernameSnapshot.data()?.uid !== req.user.uid) {
+                    throw Object.assign(new Error('That username is already in use.'), { status:409 });
+                }
+                const previousNormalized = normalizeUsername(profileSnapshot.data()?.username || '');
+                if (previousNormalized && previousNormalized !== next.normalized) {
+                    transaction.delete(qelumiUsernamesCollection().doc(stableHash(previousNormalized)));
+                }
+                transaction.set(usernameReference, {
+                    uid:req.user.uid, username:next.username, normalized:next.normalized,
+                    updatedAt:FieldValue.serverTimestamp()
+                });
+                transaction.set(profileReference, {
+                    uid:req.user.uid, username:next.username, normalized:next.normalized,
+                    updatedAt:FieldValue.serverTimestamp()
+                }, { merge:true });
+            });
+            res.json({ ok:true, profile:{username:next.username} });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message || 'The username could not be saved.' } });
+        }
+    });
+
+app.post('/api/live/translate', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:180, key:req => `live-translate:${req.user.uid}` }), async (req, res) => {
+        try {
+            res.json({ translation:await translateLiveText(req.body || {}, req.user.uid) });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'LIVE_TRANSLATION_FAILED' } });
+        }
+    });
+
+app.post('/api/live/transcribe', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:120, key:req => `live-transcribe:${req.user.uid}` }), async (req, res) => {
+        try {
+            res.json({ transcription:await transcribeLiveAudio(req.body?.audioData, req.user.uid) });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'LIVE_TRANSCRIPTION_FAILED' } });
+        }
+    });
+
+app.get('/api/live-conversations', requireUser, requireRegisteredUser, async (req, res) => {
+    const snapshot = await liveConversationsCollection().where('memberUids', 'array-contains', req.user.uid).limit(40).get();
+    const rooms = snapshot.docs.map(document => publicLiveRoom(document))
+        .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+    res.json({ rooms });
+});
+
+app.post('/api/live-conversations', requireUser, requireRegisteredUser,
+    rateLimit({ windowMs:60 * 60_000, max:20, key:req => `live-room-create:${req.user.uid}` }), async (req, res) => {
+        try {
+            const selfLanguage = String(req.body?.selfLanguage || '').toUpperCase();
+            const partnerLanguage = String(req.body?.partnerLanguage || '').toUpperCase();
+            const partnerUsername = String(req.body?.partnerUsername || '').normalize('NFKC').trim();
+            if (!LANGUAGES[selfLanguage] || !LANGUAGES[partnerLanguage] || selfLanguage === partnerLanguage) {
+                return res.status(400).json({ error:{ message:'Choose two different supported languages.' } });
+            }
+            const selfProfile = await qelumiProfilesCollection().doc(req.user.uid).get();
+            const selfUsername = String(selfProfile.data()?.username || '');
+            let partnerUid = ''; let partnerDisplayUsername = '';
+            if (partnerUsername) {
+                const normalizedPartner = normalizeUsername(partnerUsername.replace(/^@/, ''));
+                const usernameSnapshot = await qelumiUsernamesCollection().doc(stableHash(normalizedPartner)).get();
+                if (!usernameSnapshot.exists) return res.status(404).json({ error:{ message:'No Qelumi user has that exact username.' } });
+                partnerUid = String(usernameSnapshot.data()?.uid || '');
+                partnerDisplayUsername = String(usernameSnapshot.data()?.username || partnerUsername);
+                if (!partnerUid || partnerUid === req.user.uid) return res.status(400).json({ error:{ message:'Invite another Qelumi user, not your own username.' } });
+            }
+            const roomReference = liveConversationsCollection().doc();
+            const inviteCode = partnerUid ? '' : await uniqueInviteCode();
+            const now = Date.now();
+            const participants = [
+                {uid:req.user.uid, username:selfUsername, language:selfLanguage},
+                ...(partnerUid ? [{uid:partnerUid, username:partnerDisplayUsername, language:partnerLanguage}] : [])
+            ];
+            const room = {
+                status:partnerUid ? 'active' : 'waiting',
+                languageA:selfLanguage, languageB:partnerLanguage,
+                memberUids:participants.map(item => item.uid), participants,
+                creatorUid:req.user.uid, inviteCode,
+                createdAt:FieldValue.serverTimestamp(), updatedAt:FieldValue.serverTimestamp(),
+                createdAtMs:now, updatedAtMs:now, expiresAtMs:now + 7 * 24 * 60 * 60_000
+            };
+            await roomReference.set(room);
+            res.status(201).json({ room:publicLiveRoom(room, roomReference.id) });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message || 'The conversation could not be created.' } });
+        }
+    });
+
+app.post('/api/live-conversations/join', requireUser, requireRegisteredUser,
+    rateLimit({ windowMs:60 * 60_000, max:30, key:req => `live-room-join:${req.user.uid}` }), async (req, res) => {
+        try {
+            const inviteCode = String(req.body?.inviteCode || '').trim().toUpperCase().replace(/[^A-Z2-9]/g, '');
+            if (inviteCode.length !== 8) return res.status(400).json({ error:{ message:'Enter the complete eight-character invite code.' } });
+            const match = await liveConversationsCollection().where('inviteCode', '==', inviteCode).limit(1).get();
+            if (match.empty) return res.status(404).json({ error:{ message:'That invite code was not found.' } });
+            const roomReference = match.docs[0].ref;
+            const profile = await qelumiProfilesCollection().doc(req.user.uid).get();
+            await db.runTransaction(async transaction => {
+                const snapshot = await transaction.get(roomReference);
+                if (!snapshot.exists) throw Object.assign(new Error('That conversation no longer exists.'), { status:404 });
+                const room = snapshot.data();
+                const members = Array.isArray(room.memberUids) ? room.memberUids : [];
+                if (members.includes(req.user.uid)) return;
+                if (members.length >= 2 || room.status === 'closed') throw Object.assign(new Error('That conversation already has two participants.'), { status:409 });
+                if (Number(room.expiresAtMs || 0) < Date.now()) throw Object.assign(new Error('That invite code has expired.'), { status:410 });
+                const participants = participantList(room.participants);
+                participants.push({
+                    uid:req.user.uid, username:String(profile.data()?.username || ''), language:String(room.languageB || '')
+                });
+                transaction.update(roomReference, {
+                    memberUids:[...members, req.user.uid], participants, status:'active', inviteCode:'',
+                    updatedAt:FieldValue.serverTimestamp(), updatedAtMs:Date.now()
+                });
+            });
+            const joined = await roomReference.get();
+            res.json({ room:publicLiveRoom(joined) });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message || 'The conversation could not be joined.' } });
+        }
+    });
+
+app.get('/api/live-conversations/:roomId', requireUser, requireRegisteredUser, async (req, res) => {
+    const room = await liveConversationsCollection().doc(String(req.params.roomId || '')).get();
+    if (!room.exists) return res.status(404).json({ error:{ message:'Conversation not found.' } });
+    if (!Array.isArray(room.data()?.memberUids) || !room.data().memberUids.includes(req.user.uid)) {
+        return res.status(403).json({ error:{ message:'You do not have access to that conversation.' } });
+    }
+    res.json({ room:publicLiveRoom(room) });
+});
+
+app.post('/api/live-conversations/:roomId/messages', requireUser, requireRegisteredUser,
+    rateLimit({ windowMs:60 * 60_000, max:240, key:req => `live-room-message:${req.user.uid}` }), async (req, res) => {
+        try {
+            const roomReference = liveConversationsCollection().doc(String(req.params.roomId || ''));
+            const roomSnapshot = await roomReference.get();
+            if (!roomSnapshot.exists) return res.status(404).json({ error:{ message:'Conversation not found.' } });
+            const room = roomSnapshot.data();
+            if (!Array.isArray(room.memberUids) || !room.memberUids.includes(req.user.uid)) {
+                return res.status(403).json({ error:{ message:'You do not have access to that conversation.' } });
+            }
+            if (room.memberUids.length !== 2 || room.status !== 'active') {
+                return res.status(409).json({ error:{ message:'Wait for the second participant before sending a message.' } });
+            }
+            const participant = participantList(room.participants).find(item => item.uid === req.user.uid);
+            const sourceLang = String(participant?.language || '');
+            const targetLang = sourceLang === room.languageA ? room.languageB : room.languageA;
+            const translation = await translateLiveText({
+                text:req.body?.text, sourceLang, targetLang
+            }, req.user.uid);
+            const messageReference = roomReference.collection('messages').doc();
+            const now = Date.now();
+            const message = {
+                senderUid:req.user.uid, sourceText:translation.sourceText, translatedText:translation.translatedText,
+                sourceLang:translation.sourceLang, targetLang:translation.targetLang,
+                createdAt:FieldValue.serverTimestamp(), createdAtMs:now
+            };
+            await Promise.all([
+                messageReference.set(message),
+                roomReference.update({updatedAt:FieldValue.serverTimestamp(), updatedAtMs:now})
+            ]);
+            res.status(201).json({ message:{id:messageReference.id, ...message, createdAt:null} });
+        } catch (error) {
+            res.status(error.status || 500).json({ error:{ message:error.message || 'The message could not be sent.' } });
+        }
+    });
+
+app.post('/api/live-conversations/:roomId/save', requireUser, requireRegisteredUser,
+    rateLimit({ windowMs:60 * 60_000, max:30, key:req => `live-room-save:${req.user.uid}` }), async (req, res) => {
+        const roomReference = liveConversationsCollection().doc(String(req.params.roomId || ''));
+        const roomSnapshot = await roomReference.get();
+        if (!roomSnapshot.exists) return res.status(404).json({ error:{ message:'Conversation not found.' } });
+        const room = roomSnapshot.data();
+        if (!Array.isArray(room.memberUids) || !room.memberUids.includes(req.user.uid)) {
+            return res.status(403).json({ error:{ message:'You do not have access to that conversation.' } });
+        }
+        const messagesSnapshot = await roomReference.collection('messages').limit(250).get();
+        const messages = messagesSnapshot.docs.map(document => ({id:document.id, ...document.data(), createdAt:null}))
+            .sort((left, right) => Number(left.createdAtMs || 0) - Number(right.createdAtMs || 0));
+        await db.doc(`artifacts/${APP_ID}/users/${req.user.uid}/conversation_sessions/live-${roomReference.id}`).set({
+            mode:'connected', roomId:roomReference.id,
+            languageA:room.languageA, languageB:room.languageB,
+            participants:participantList(room.participants), messages,
+            createdAtMs:Number(room.createdAtMs || 0), savedAt:Date.now()
+        }, {merge:true});
+        res.json({ok:true, messageCount:messages.length});
+    });
 
 app.post('/api/gemini', requireUser, rateLimit({ windowMs:60 * 60_000, max:80, key:req => `gemini:${req.user.uid}` }), async (req, res) => {
     try {
