@@ -16,7 +16,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.4.0';
+const BACKEND_VERSION = '4.5.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -573,7 +573,8 @@ app.get('/health', (_req, res) => res.json({
         mobileBridge:true, performanceDashboard:true,
         liveTranscript:true, automaticSpeechDetection:true,
         localConversation:true, connectedConversation:true,
-        languageLab:true, savedWorkspaces:true
+        languageLab:true, savedWorkspaces:true,
+        editableConversationTranscripts:true, readAloudVoiceControls:true
     },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     renderCache:{
