@@ -16,7 +16,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.1.1';
+const BACKEND_VERSION = '4.2.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -44,6 +44,9 @@ const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KE
 
 const feedbackCollection = () => db.collection('artifacts').doc(APP_ID).collection('public').doc('data').collection('feedback');
 const translationSearchCollection = () => db.collection('admin_metrics').doc('translation_searches').collection('items');
+const administratorRolesCollection = () => db.collection('admin_roles');
+const administratorAuditCollection = () => db.collection('admin_role_audit');
+const administratorRoleDocumentId = uid => crypto.createHash('sha256').update(String(uid || '')).digest('hex');
 const timestampMillis = value => value?.toMillis?.() || Number(value) || 0;
 const htmlEscape = value => String(value ?? '').replace(/[&<>"']/g, character => ({
     '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
@@ -127,6 +130,36 @@ function requireAdmin(req, res, next) {
     if (req.user?.uid !== ADMIN_UID && req.user?.admin !== true) return res.status(403).json({ error:{ message:'Administrator access required.' } });
     next();
 }
+
+async function resolveAdministratorTarget(identifier) {
+    const value = String(identifier || '').trim();
+    if (!value || value.length > 320) {
+        const error = new Error('Enter an exact Firebase email address or UID.');
+        error.status = 400;
+        throw error;
+    }
+    try {
+        return value.includes('@')
+            ? await auth.getUserByEmail(value.toLowerCase())
+            : await auth.getUser(value);
+    } catch (error) {
+        if (error.code === 'auth/user-not-found') {
+            const notFound = new Error('No Firebase account matches that email address or UID.');
+            notFound.status = 404;
+            throw notFound;
+        }
+        throw error;
+    }
+}
+
+const publicAdministratorRecord = userRecord => ({
+    uid:userRecord.uid,
+    email:userRecord.email || '',
+    displayName:userRecord.displayName || '',
+    disabled:userRecord.disabled === true,
+    admin:userRecord.uid === ADMIN_UID || userRecord.customClaims?.admin === true,
+    primary:userRecord.uid === ADMIN_UID
+});
 
 async function recordUsage(uid, operation, metadata = {}) {
     const day = new Date().toISOString().slice(0, 10); const ref = db.doc(`admin_metrics/api_usage/days/${day}`);
@@ -562,8 +595,100 @@ app.get('/api/jobs/:id', requireUser, async (req, res) => {
 });
 
 app.post('/api/admin/bootstrap', requireUser, requireAdmin, async (req, res) => {
-    await auth.setCustomUserClaims(req.user.uid, { admin:true });
+    const userRecord = await auth.getUser(req.user.uid);
+    await auth.setCustomUserClaims(req.user.uid, { ...(userRecord.customClaims || {}), admin:true });
+    await administratorRolesCollection().doc(administratorRoleDocumentId(req.user.uid)).set({
+        uid:req.user.uid,
+        email:userRecord.email || req.user.email || '',
+        displayName:userRecord.displayName || '',
+        enabled:true,
+        primary:req.user.uid === ADMIN_UID,
+        grantedBy:req.user.uid,
+        updatedAt:FieldValue.serverTimestamp()
+    }, { merge:true });
     res.json({ ok:true, message:'Administrator claim assigned. Sign out and back in to refresh it.' });
+});
+
+app.get('/api/admin/users/lookup', requireUser, requireAdmin, async (req, res) => {
+    try {
+        const userRecord = await resolveAdministratorTarget(req.query.identifier);
+        res.json({ user:publicAdministratorRecord(userRecord) });
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message } });
+    }
+});
+
+app.get('/api/admin/roles', requireUser, requireAdmin, async (_req, res) => {
+    try {
+        const snapshot = await administratorRolesCollection().get();
+        const roleRecords = snapshot.docs.map(document => document.data()).filter(record => record.enabled === true);
+        const uids = [...new Set([ADMIN_UID, ...roleRecords.map(record => record.uid).filter(Boolean)])];
+        const users = [];
+        for (let index = 0; index < uids.length; index += 100) {
+            const batch = await auth.getUsers(uids.slice(index, index + 100).map(uid => ({ uid })));
+            users.push(...batch.users.map(publicAdministratorRecord));
+        }
+        users.sort((left, right) => Number(right.primary) - Number(left.primary)
+            || String(left.email || left.uid).localeCompare(String(right.email || right.uid), undefined, { sensitivity:'base' }));
+        res.json({ administrators:users });
+    } catch (error) {
+        res.status(500).json({ error:{ message:error.message || 'Unable to list administrators.' } });
+    }
+});
+
+app.post('/api/admin/roles', requireUser, requireAdmin, async (req, res) => {
+    try {
+        if (typeof req.body?.enabled !== 'boolean') {
+            return res.status(400).json({ error:{ message:'The enabled field must be true or false.' } });
+        }
+        const target = await resolveAdministratorTarget(req.body?.identifier);
+        const enabled = req.body.enabled;
+        if (enabled && target.disabled) {
+            return res.status(409).json({ error:{ message:'Enable this Firebase account before granting administrator access.' } });
+        }
+        if (!enabled && target.uid === ADMIN_UID) {
+            return res.status(409).json({ error:{ message:'The primary administrator cannot be revoked.' } });
+        }
+        if (!enabled && target.uid === req.user.uid) {
+            return res.status(409).json({ error:{ message:'You cannot revoke your own administrator access.' } });
+        }
+
+        const claims = { ...(target.customClaims || {}) };
+        if (enabled) claims.admin = true;
+        else delete claims.admin;
+        await auth.setCustomUserClaims(target.uid, claims);
+        if (!enabled) await auth.revokeRefreshTokens(target.uid);
+
+        await administratorRolesCollection().doc(administratorRoleDocumentId(target.uid)).set({
+            uid:target.uid,
+            email:target.email || '',
+            displayName:target.displayName || '',
+            enabled,
+            primary:target.uid === ADMIN_UID,
+            grantedBy:enabled ? req.user.uid : FieldValue.delete(),
+            revokedBy:enabled ? FieldValue.delete() : req.user.uid,
+            updatedAt:FieldValue.serverTimestamp()
+        }, { merge:true });
+        await administratorAuditCollection().add({
+            action:enabled ? 'administrator_granted' : 'administrator_revoked',
+            actorUid:req.user.uid,
+            actorEmail:req.user.email || '',
+            targetUid:target.uid,
+            targetEmail:target.email || '',
+            timestamp:FieldValue.serverTimestamp()
+        });
+
+        const refreshed = await auth.getUser(target.uid);
+        res.json({
+            ok:true,
+            user:publicAdministratorRecord(refreshed),
+            message:enabled
+                ? 'Administrator access granted. The user must sign out and back in to refresh the session.'
+                : 'Administrator access revoked. Existing sessions will be rejected when their token is refreshed.'
+        });
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message || 'Unable to update administrator access.' } });
+    }
 });
 
 app.get('/api/admin/metrics', requireUser, requireAdmin, async (_req, res) => {

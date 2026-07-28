@@ -18,7 +18,7 @@ export const CEFR_LEVELS = Object.freeze(['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'U
 export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less common', 'Rare', 'Specialized']);
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 
-export const DICTIONARY_SCHEMA_VERSION = 15;
+export const DICTIONARY_SCHEMA_VERSION = 16;
 export const PREVIEW_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
@@ -30,7 +30,7 @@ const NON_QUALIFYING_USAGE = new Set(['rare', 'archaic', 'abbreviation', 'fragme
 
 // These machine-readable keys are never displayed. They let the backend verify
 // that a model covered the source language's own verb system instead of merely
-// returning two or three familiar tenses. Schema 15 requires one user-facing
+// returning two or three familiar tenses. Schema 16 retains one user-facing
 // tense/form per group so broad headings cannot hide several paradigms inside
 // an unreadable combined block.
 export const CONJUGATION_COVERAGE = Object.freeze({
@@ -173,7 +173,7 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
             },
             required:['cefrLevel', 'frequencyBand', 'modality', 'sourceNote', 'targetNote']
         },
-        mainTranslation:textArray(8),
+        mainTranslation:textArray(20),
         pronunciationGuide:{ type:'string' },
         etymology:{
             type:'object', additionalProperties:false,
@@ -196,13 +196,13 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
         synonyms:bilingualLists(10),
         similarPhrases:bilingualLists(10),
         meanings:{
-            type:'array', maxItems:8,
+            type:'array', maxItems:12,
             items:{
                 type:'object', additionalProperties:false,
                 properties:{
                     label:{ type:'string' }, partOfSpeech:{ type:'string' },
                     register:{ type:'string', enum:REGISTER_VALUES },
-                    sourceDefinition:{ type:'string' }, targetDefinition:{ type:'string' }, translations:textArray(8)
+                    sourceDefinition:{ type:'string' }, targetDefinition:{ type:'string' }, translations:textArray(12)
                 },
                 required:['label', 'partOfSpeech', 'register', 'sourceDefinition', 'targetDefinition', 'translations']
             }
@@ -711,6 +711,27 @@ export function normalizeTranslationResult(rawResult, context) {
     const partOfSpeech = normalizePartOfSpeech(result.partOfSpeech, context.query);
     const isVerb = result.isVerb === true || /\bverb\b/iu.test(partOfSpeech);
     const conjugationGroups = normalizeConjugations({ ...result, isVerb }, context.fromLang);
+    const meanings = (Array.isArray(result.meanings) ? result.meanings : []).map((meaning, index) => ({
+        label:normalizeMeaningLabel(meaning?.label, index),
+        // Keep each sense's grammatical classification separate from its
+        // semantic title and from the entry-level list of all classes.
+        partOfSpeech:normalizePartOfSpeech(meaning?.partOfSpeech, context.query),
+        // A production meaning must carry its own register. Do not silently
+        // inherit the entry-level compatibility label, because mixed-register
+        // words such as "awesome", "lit" and "cheers" need distinct labels.
+        register:normalizeRegister(meaning?.register, ''),
+        sourceDefinition:cleanText(meaning?.sourceDefinition),
+        targetDefinition:cleanText(meaning?.targetDefinition),
+        translations:cleanTextArray(meaning?.translations, 12)
+    })).filter(meaning => meaning.label || meaning.sourceDefinition);
+    // The summary is the union of the model's overview and every sense-level
+    // translation. This prevents a valid noun/verb/adjective translation from
+    // disappearing merely because it was returned under meanings rather than
+    // repeated in mainTranslation.
+    const mainTranslation = cleanTextArray([
+        ...(Array.isArray(result.mainTranslation) ? result.mainTranslation : []),
+        ...meanings.flatMap(meaning => meaning.translations)
+    ], 20);
     const normalized = {
         detectedSourceLang:cleanCode(result.detectedSourceLang) || requested,
         sourceLanguageValidation:validation,
@@ -721,7 +742,7 @@ export function normalizeTranslationResult(rawResult, context) {
         partOfSpeech,
         formality,
         learningMetadata:normalizeLearningMetadata(result.learningMetadata, context.definitionsOnly === true),
-        mainTranslation:cleanTextArray(result.mainTranslation, 8),
+        mainTranslation,
         pronunciationGuide:sourceOnlyPronunciation(result.pronunciationGuide, context.fromLang),
         etymology:{ sourceLang:cleanText(result.etymology?.sourceLang), targetLang:cleanText(result.etymology?.targetLang) },
         isVerb,
@@ -730,19 +751,7 @@ export function normalizeTranslationResult(rawResult, context) {
         definitions:normalizeBilingual(result.definitions),
         synonyms:normalizeBilingual(result.synonyms),
         similarPhrases:normalizeBilingual(result.similarPhrases || result.relatedPhrases),
-        meanings:(Array.isArray(result.meanings) ? result.meanings : []).map((meaning, index) => ({
-            label:normalizeMeaningLabel(meaning?.label, index),
-            // Keep each sense's grammatical classification separate from its
-            // semantic title and from the entry-level list of all classes.
-            partOfSpeech:normalizePartOfSpeech(meaning?.partOfSpeech, context.query),
-            // A production meaning must carry its own register. Do not silently
-            // inherit the entry-level compatibility label, because mixed-register
-            // words such as "awesome", "lit" and "cheers" need distinct labels.
-            register:normalizeRegister(meaning?.register, ''),
-            sourceDefinition:cleanText(meaning?.sourceDefinition),
-            targetDefinition:cleanText(meaning?.targetDefinition),
-            translations:cleanTextArray(meaning?.translations, 8)
-        })).filter(meaning => meaning.label || meaning.sourceDefinition),
+        meanings,
         collocations:normalizeBilingual(result.collocations || result.relatedPhrases),
         usageWarnings:normalizeBilingual(result.usageWarnings),
         grammarNotes:normalizeBilingual(result.grammarNotes),
@@ -794,6 +803,27 @@ function bilingualHasContent(value, definitionsOnly, allowEmpty = false) {
     if (!value || !Array.isArray(value.sourceLang) || !Array.isArray(value.targetLang)) return false;
     if (!allowEmpty && !value.sourceLang.some(hasText)) return false;
     return definitionsOnly || allowEmpty || value.targetLang.some(hasText);
+}
+
+const GRAMMATICAL_FAMILY_PATTERNS = Object.freeze([
+    ['noun', /\bnoun\b/iu],
+    ['verb', /\bverb\b/iu],
+    ['adjective', /\badjective\b/iu],
+    ['adverb', /\badverb\b/iu],
+    ['pronoun', /\bpronoun\b/iu],
+    ['preposition', /\bpreposition\b/iu],
+    ['conjunction', /\bconjunction\b/iu],
+    ['interjection', /\binterjection\b/iu],
+    ['determiner', /\bdeterminer\b/iu],
+    ['article', /\barticle\b/iu],
+    ['numeral', /\bnumeral\b/iu]
+]);
+
+export function grammaticalFamilies(value) {
+    const text = cleanText(value);
+    return GRAMMATICAL_FAMILY_PATTERNS
+        .filter(([, pattern]) => pattern.test(text))
+        .map(([family]) => family);
 }
 
 export function requiredConjugationCoverage(languageCode) {
@@ -855,6 +885,26 @@ export function coreQualityIssues(result, context) {
             || !hasText(meaning.sourceDefinition) || !REGISTER_VALUES.includes(meaning.register)
             || (!definitionsOnly && (!hasText(meaning.targetDefinition) || !meaning.translations?.some(hasText))))) {
         issues.push('missing or incomplete meanings');
+    }
+    if (Array.isArray(result.meanings) && result.meanings.length) {
+        const entryFamilies = grammaticalFamilies(result.partOfSpeech);
+        const meaningFamilies = new Set(result.meanings.flatMap(meaning => grammaticalFamilies(meaning.partOfSpeech)));
+        const missingFamilies = entryFamilies.filter(family => !meaningFamilies.has(family));
+        if (missingFamilies.length) {
+            issues.push(`meanings do not cover entry grammatical classes: ${missingFamilies.join(', ')}`);
+        }
+        if (!definitionsOnly) {
+            const meaningTranslationKeys = new Set(result.meanings
+                .flatMap(meaning => meaning.translations || [])
+                .filter(hasText)
+                .map(normalizeDictionaryQuery));
+            const unmappedTranslations = (result.mainTranslation || [])
+                .filter(hasText)
+                .filter(translation => !meaningTranslationKeys.has(normalizeDictionaryQuery(translation)));
+            if (unmappedTranslations.length) {
+                issues.push(`main translations are not mapped to meanings: ${unmappedTranslations.join(', ')}`);
+            }
+        }
     }
     if (!bilingualHasContent(result.usageWarnings, definitionsOnly, true)) issues.push('invalid usage-warnings section');
     if (!bilingualHasContent(result.grammarNotes, definitionsOnly, true)) issues.push('invalid grammar-notes section');
@@ -965,6 +1015,8 @@ First decide only what production needs: whether the exact input is genuinely es
 Validation fields must be internally consistent. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish that is not valid in any supported language. If existsInRequestedLanguage=false, return every linguistic field empty: no translation, definition, etymology, pronunciation, meaning, context, conjugation, phrase, synonym, family, or minimal pair. The server will enforce this rule again.
 
 For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must classify the exact whole input using concise English grammatical labels so the interface remains consistent. For a multiword entry, use a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Adjective phrase, Idiomatic expression, Clause or Sentence; never reduce "escape valve" to the bare single-word label "Noun". When established senses span word classes, list all of them, for example "Noun · Verb". Set isVerb=true whenever at least one established sense is verbal, even if the entry is also a noun or adjective.
+
+SENSE AND TRANSLATION COVERAGE IS MANDATORY. Identify every established, practically useful grammatical class and distinct common sense of the exact entry, rather than stopping after its first or most familiar use. Include at least one meanings item for every class named in partOfSpeech. For example, if partOfSpeech is "Noun · Verb", meanings must contain both a noun sense and a verb sense with their own definitions and translations. Every destination-language item in mainTranslation must appear under the appropriate meanings item, and every translation listed under a meaning must also appear in mainTranslation. mainTranslation is therefore a de-duplicated overview of all sense-level translations, not a shorter competing answer. Do not let the quick-preview wording influence completeness: the complete result must stand on its own and may contain more senses and translations than a preview.
 
 pronunciationGuide must contain one concise pronunciation of the exact source entry in ${fromName} only. Never add a destination-language pronunciation, never return a bilingual pronunciation pair, and never append language labels such as "(EN)" or "(FR)".
 
@@ -1946,8 +1998,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         // Learning metadata was introduced in schema v12. A structurally sound older
         // non-verb may still render immediately while its background refresh upgrades
         // it. Missing schema-v13 coverage metadata, schema-v14 per-meaning
-        // grammatical classifications, and schema-v15 one-tense-per-item
-        // paradigms remain blocking.
+        // grammatical classifications, schema-v15 one-tense-per-item paradigms,
+        // and schema-v16 sense/class translation coverage remain blocking.
         const cacheBlockingIssues = needsSchemaRefresh
             ? cachedIssues.filter(issue => !upgradeOnlyIssues.has(issue))
             : cachedIssues;
