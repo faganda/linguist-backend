@@ -17,8 +17,9 @@ export const USAGE_LEVELS = Object.freeze([
 export const CEFR_LEVELS = Object.freeze(['A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'Unclassified']);
 export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less common', 'Rare', 'Specialized']);
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
+export const ANTONYM_STATUS_VALUES = Object.freeze(['available', 'no-direct-antonym']);
 
-export const DICTIONARY_SCHEMA_VERSION = 16;
+export const DICTIONARY_SCHEMA_VERSION = 17;
 export const PREVIEW_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
@@ -30,7 +31,7 @@ const NON_QUALIFYING_USAGE = new Set(['rare', 'archaic', 'abbreviation', 'fragme
 
 // These machine-readable keys are never displayed. They let the backend verify
 // that a model covered the source language's own verb system instead of merely
-// returning two or three familiar tenses. Schema 16 retains one user-facing
+// returning two or three familiar tenses. Schema 17 retains one user-facing
 // tense/form per group so broad headings cannot hide several paradigms inside
 // an unreadable combined block.
 export const CONJUGATION_COVERAGE = Object.freeze({
@@ -194,6 +195,15 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
         },
         definitions:bilingualLists(6),
         synonyms:bilingualLists(10),
+        antonyms:{
+            type:'object', additionalProperties:false,
+            properties:{
+                status:{ type:'string', enum:ANTONYM_STATUS_VALUES },
+                sourceLang:textArray(10),
+                targetLang:textArray(10)
+            },
+            required:['status', 'sourceLang', 'targetLang']
+        },
         similarPhrases:bilingualLists(10),
         meanings:{
             type:'array', maxItems:12,
@@ -246,7 +256,7 @@ export const CORE_RESPONSE_SCHEMA = Object.freeze({
     required:[
         'detectedSourceLang', 'sourceLanguageValidation', 'wordExists', 'suggestedCorrection', 'extractedText',
         'partOfSpeech', 'formality', 'learningMetadata', 'mainTranslation', 'pronunciationGuide', 'etymology', 'isVerb',
-        'conjugationGroups', 'definitions', 'synonyms', 'similarPhrases', 'meanings', 'collocations',
+        'conjugationGroups', 'definitions', 'synonyms', 'antonyms', 'similarPhrases', 'meanings', 'collocations',
         'usageWarnings', 'grammarNotes', 'regionalVariants', 'wordFamily', 'minimalPairs', 'contexts'
     ]
 });
@@ -448,6 +458,12 @@ function normalizeBilingual(value) {
     };
 }
 
+function normalizeAntonyms(value) {
+    const bilingual = normalizeBilingual(value);
+    const status = ANTONYM_STATUS_VALUES.includes(value?.status) ? value.status : '';
+    return { status, ...bilingual };
+}
+
 function normalizedValidation(raw, requestedSource) {
     const requestedLanguage = cleanCode(requestedSource) || cleanCode(raw?.requestedLanguage);
     let validLanguages = [...new Set((Array.isArray(raw?.validLanguages) ? raw.validLanguages : []).map(cleanCode).filter(Boolean))];
@@ -555,6 +571,7 @@ export function stripLinguisticContent(result, context = {}) {
         mainTranslation:[], pronunciationGuide:'',
         etymology:{ sourceLang:'', targetLang:'' }, isVerb:false, conjugationGroups:[], conjugations:{},
         definitions:{ sourceLang:[], targetLang:[] }, synonyms:{ sourceLang:[], targetLang:[] },
+        antonyms:{ status:'no-direct-antonym', sourceLang:[], targetLang:[] },
         similarPhrases:{ sourceLang:[], targetLang:[] }, meanings:[], collocations:{ sourceLang:[], targetLang:[] },
         usageWarnings:{ sourceLang:[], targetLang:[] }, grammarNotes:{ sourceLang:[], targetLang:[] },
         regionalVariants:[], wordFamily:[], minimalPairs:[], contexts:[],
@@ -750,6 +767,7 @@ export function normalizeTranslationResult(rawResult, context) {
         conjugations:conjugationObject(conjugationGroups),
         definitions:normalizeBilingual(result.definitions),
         synonyms:normalizeBilingual(result.synonyms),
+        antonyms:normalizeAntonyms(result.antonyms),
         similarPhrases:normalizeBilingual(result.similarPhrases || result.relatedPhrases),
         meanings,
         collocations:normalizeBilingual(result.collocations || result.relatedPhrases),
@@ -784,7 +802,7 @@ export function prepareDefinitionsOnlyResult(value) {
     result.mainTranslation = [];
     if (result.learningMetadata) result.learningMetadata.targetNote = '';
     if (result.etymology) result.etymology.targetLang = '';
-    ['definitions', 'synonyms', 'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes'].forEach(field => {
+    ['definitions', 'synonyms', 'antonyms', 'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes'].forEach(field => {
         if (result[field]) result[field].targetLang = [];
     });
     result.meanings = (result.meanings || []).map(meaning => ({ ...meaning, targetDefinition:'', translations:[] }));
@@ -877,6 +895,18 @@ export function coreQualityIssues(result, context) {
     if (!definitionsOnly && !hasText(result.etymology?.targetLang)) issues.push('missing target etymology');
     if (!bilingualHasContent(result.definitions, definitionsOnly)) issues.push('missing definitions');
     if (!bilingualHasContent(result.synonyms, definitionsOnly)) issues.push('missing synonyms');
+    if (!result.antonyms
+        || !Array.isArray(result.antonyms.sourceLang)
+        || !Array.isArray(result.antonyms.targetLang)
+        || !ANTONYM_STATUS_VALUES.includes(result.antonyms.status)) {
+        issues.push('missing antonym decision');
+    } else if (result.antonyms.status === 'available'
+        && !bilingualHasContent(result.antonyms, definitionsOnly)) {
+        issues.push('missing declared antonyms');
+    } else if (result.antonyms.status === 'no-direct-antonym'
+        && (result.antonyms.sourceLang.some(hasText) || result.antonyms.targetLang.some(hasText))) {
+        issues.push('antonym decision contradicts returned entries');
+    }
     const sourceRelated = [...(result.similarPhrases?.sourceLang || []), ...(result.collocations?.sourceLang || [])];
     const targetRelated = [...(result.similarPhrases?.targetLang || []), ...(result.collocations?.targetLang || [])];
     if (!sourceRelated.some(hasText) || (!definitionsOnly && !targetRelated.some(hasText))) issues.push('missing related phrases or collocations');
@@ -923,7 +953,7 @@ export function hasLinguisticContent(result) {
     return hasText(result.partOfSpeech) || hasText(result.pronunciationGuide) || hasText(result.formality)
         || hasText(result.learningMetadata?.sourceNote) || hasText(result.learningMetadata?.targetNote)
         || result.mainTranslation?.some(hasText) || hasText(result.etymology?.sourceLang) || hasText(result.etymology?.targetLang)
-        || ['definitions', 'synonyms', 'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes']
+        || ['definitions', 'synonyms', 'antonyms', 'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes']
             .some(field => result[field]?.sourceLang?.some(hasText) || result[field]?.targetLang?.some(hasText))
         || ['meanings', 'regionalVariants', 'wordFamily', 'minimalPairs', 'contexts', 'conjugationGroups']
             .some(field => Array.isArray(result[field]) && result[field].length > 0);
@@ -981,7 +1011,7 @@ export function buildPreviewRequest(context, { repairSource = null } = {}) {
     const repairInstruction = repairSource
         ? `\nRepair these preview-gate issues: ${repairSource.issues.join('; ')}. Do not repeat them.\nDraft preview JSON:\n${JSON.stringify(repairSource.result)}`
         : '';
-    const system = `You are Qelumi's fast multilingual dictionary preview engine. Analyse the exact input, never a corrected substitute. Return only the small preview requested by the schema; do not generate etymology, conjugations, synonyms, related phrases, regional variants, word families, contexts or examples.
+    const system = `You are Qelumi's fast multilingual dictionary preview engine. Analyse the exact input, never a corrected substitute. Return only the small preview requested by the schema; do not generate etymology, conjugations, synonyms, antonyms, related phrases, regional variants, word families, contexts or examples.
 
 First decide whether the exact input is genuinely established in requested source ${fromName} (${context.fromLang}). Grammatical sentences, established loanwords, expressions, specialised terms, and well-established fictional or cultural proper names qualify. Language origin is not language membership. Shared established words such as apocalypse and saboteur qualify in English and French. "backend" is established specialised French as well as English. The offensive English clipping "tard" does not qualify as the ordinary English entry; French "tard" does. If the input does not belong to the requested source, identify its most likely language from every supported language, even when that language is neither the requested source nor the current destination.
 
@@ -1020,7 +1050,7 @@ SENSE AND TRANSLATION COVERAGE IS MANDATORY. Identify every established, practic
 
 pronunciationGuide must contain one concise pronunciation of the exact source entry in ${fromName} only. Never add a destination-language pronunciation, never return a bilingual pronunciation pair, and never append language labels such as "(EN)" or "(FR)".
 
-    Put an exact English partOfSpeech and a register on every distinct meaning because one entry may mix grammatical classes and registers. Classify the individual sense itself (for example Noun, Noun phrase, Verb, Adjective, Adverb, Phrasal verb or Idiomatic expression); do not copy the entry-level multi-class list into every meaning. Each meaning label must remain a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
+Put an exact English partOfSpeech and a register on every distinct meaning because one entry may mix grammatical classes and registers. Classify the individual sense itself (for example Noun, Noun phrase, Verb, Adjective, Adverb, Phrasal verb or Idiomatic expression); do not copy the entry-level multi-class list into every meaning. Each meaning label must remain a natural human-readable semantic title such as "Physical structure" or "Technical delay"; never use machine identifiers such as noun_structure or verb_connect and never append the part of speech to the label. formality is only a backward-compatible general label. Return useful established synonyms in both languages. For antonyms, set status="available" and return genuine direct or contextual opposites in both languages when they exist. If the entry has no responsible lexical opposite, set status="no-direct-antonym" and return empty antonym arrays rather than inventing one. Word families are optional: return [] when there is no clear genuine family, and never invent an item just to fill the section.
 
 LEARNING METADATA: estimate the entry's practical CEFR vocabulary level as A1, A2, B1, B2, C1 or C2; use Unclassified for proper names, specialist terminology or expressions that cannot responsibly be mapped. Classify frequency as Very common, Common, Less common, Rare or Specialized, and modality as Spoken, Written or Both. sourceNote must briefly explain the level, frequency and typical use in ${fromName}. ${definitionsOnly ? 'Leave targetNote empty.' : `targetNote must faithfully explain the same learning guidance in ${toName}.`} Treat these as learner guidance, not an official certification claim.
 
@@ -1993,13 +2023,16 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         const cachedSchemaVersion = Number(cached?.stored?.schemaVersion || 0);
         const needsSchemaRefresh = cachedSchemaVersion < DICTIONARY_SCHEMA_VERSION;
         const upgradeOnlyIssues = new Set([
-            'invalid learning metadata', 'missing source learning note', 'missing target learning note'
+            'invalid learning metadata', 'missing source learning note', 'missing target learning note',
+            'missing antonym decision'
         ]);
         // Learning metadata was introduced in schema v12. A structurally sound older
         // non-verb may still render immediately while its background refresh upgrades
         // it. Missing schema-v13 coverage metadata, schema-v14 per-meaning
         // grammatical classifications, schema-v15 one-tense-per-item paradigms,
         // and schema-v16 sense/class translation coverage remain blocking.
+        // Schema v17 adds normalized antonym containers and uses the version
+        // comparison below to populate them lazily in the background.
         const cacheBlockingIssues = needsSchemaRefresh
             ? cachedIssues.filter(issue => !upgradeOnlyIssues.has(issue))
             : cachedIssues;
