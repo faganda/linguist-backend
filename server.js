@@ -17,7 +17,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.8.3';
+const BACKEND_VERSION = '4.8.4';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -602,6 +602,8 @@ app.get('/health', (_req, res) => res.json({
         longTextTranslation:true,
         persistentSaveFeedback:true,
         stickyTranslationSearch:true,
+        fullBleedStickyTranslationSearch:true,
+        overlapAwareLiveTranscription:true,
         bilingualAntonyms:true
     },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
