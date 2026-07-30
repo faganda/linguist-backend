@@ -19,9 +19,9 @@ export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less com
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 export const ANTONYM_STATUS_VALUES = Object.freeze(['available', 'no-direct-antonym']);
 
-export const DICTIONARY_SCHEMA_VERSION = 18;
-export const PREVIEW_SCHEMA_VERSION = 3;
-export const TRANSLATION_LIST_SCHEMA_VERSION = 1;
+export const DICTIONARY_SCHEMA_VERSION = 19;
+export const PREVIEW_SCHEMA_VERSION = 4;
+export const TRANSLATION_LIST_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
 export const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
@@ -308,6 +308,33 @@ export const PREVIEW_RESPONSE_SCHEMA = Object.freeze({
     ]
 });
 export const TRANSLATION_LIST_RESPONSE_SCHEMA = PREVIEW_RESPONSE_SCHEMA;
+
+// The list already owns validation, pronunciation, grammatical classes,
+// meanings and every translation. The second model phase therefore asks only
+// for the remaining dictionary sections instead of regenerating the whole
+// 69-property response and risking contradictions or long provider stalls.
+export const DETAILS_RESPONSE_SCHEMA = Object.freeze({
+    type:'object', additionalProperties:false,
+    properties:{
+        learningMetadata:CORE_RESPONSE_SCHEMA.properties.learningMetadata,
+        etymology:CORE_RESPONSE_SCHEMA.properties.etymology,
+        definitions:CORE_RESPONSE_SCHEMA.properties.definitions,
+        synonyms:CORE_RESPONSE_SCHEMA.properties.synonyms,
+        antonyms:CORE_RESPONSE_SCHEMA.properties.antonyms,
+        similarPhrases:CORE_RESPONSE_SCHEMA.properties.similarPhrases,
+        collocations:CORE_RESPONSE_SCHEMA.properties.collocations,
+        usageWarnings:CORE_RESPONSE_SCHEMA.properties.usageWarnings,
+        grammarNotes:CORE_RESPONSE_SCHEMA.properties.grammarNotes,
+        regionalVariants:CORE_RESPONSE_SCHEMA.properties.regionalVariants,
+        wordFamily:CORE_RESPONSE_SCHEMA.properties.wordFamily,
+        minimalPairs:CORE_RESPONSE_SCHEMA.properties.minimalPairs
+    },
+    required:[
+        'learningMetadata', 'etymology', 'definitions', 'synonyms', 'antonyms',
+        'similarPhrases', 'collocations', 'usageWarnings', 'grammarNotes',
+        'regionalVariants', 'wordFamily', 'minimalPairs'
+    ]
+});
 
 export const EXAMPLES_RESPONSE_SCHEMA = Object.freeze({
     type:'object', additionalProperties:false,
@@ -692,6 +719,49 @@ function previewHasLinguisticContent(result) {
         );
 }
 
+export function duplicateMeaningIssues(value) {
+    const meanings = Array.isArray(value?.meanings) ? value.meanings : [];
+    const issues = [];
+    const fingerprints = new Map();
+    meanings.forEach((meaning, index) => {
+        const label = normalizeDictionaryQuery(meaning?.label);
+        const sourceDefinition = normalizeDictionaryQuery(meaning?.sourceDefinition);
+        const targetDefinition = normalizeDictionaryQuery(meaning?.targetDefinition);
+        const partOfSpeech = normalizeDictionaryQuery(meaning?.partOfSpeech);
+        const translations = cleanTextArray(meaning?.translations, 12)
+            .map(normalizeDictionaryQuery).sort().join('|');
+        const fingerprint = [label, partOfSpeech, sourceDefinition, targetDefinition, translations].join('¦');
+        if (!label && !sourceDefinition && !targetDefinition) return;
+        if (fingerprints.has(fingerprint)) {
+            issues.push(`duplicate meaning ${fingerprints.get(fingerprint) + 1} and ${index + 1}`);
+        } else {
+            fingerprints.set(fingerprint, index);
+        }
+    });
+    return issues;
+}
+
+function primaryTranslationListCoverageRisks(result, context) {
+    if (!result?.sourceLanguageValidation?.existsInRequestedLanguage || !result.wordExists) return [];
+    const query = normalizeDictionaryQuery(context.query);
+    const translations = cleanTextArray(result.mainTranslation, 20);
+    const meanings = Array.isArray(result.meanings) ? result.meanings : [];
+    const partOfSpeech = cleanText(result.partOfSpeech);
+    const risks = [];
+    const isLowercaseSingleWord = /^\p{Ll}[\p{L}\p{M}'’-]*$/u.test(String(context.query || '').trim());
+    const partFamilies = grammaticalFamilies(partOfSpeech);
+    const properNameOnly = /\b(?:proper noun|proper name|surname|family name)\b/iu.test(partOfSpeech)
+        && partFamilies.every(family => family === 'noun');
+    if (isLowercaseSingleWord && properNameOnly) {
+        risks.push('lowercase lexical entry was reduced to a proper name');
+    }
+    if (meanings.length === 1 && translations.length === 1
+        && normalizeDictionaryQuery(translations[0]) === query) {
+        risks.push('identity-only translation may have omitted ordinary lexical senses');
+    }
+    return risks;
+}
+
 export function previewQualityIssues(result, context) {
     const issues = [];
     if (!result || typeof result !== 'object') return ['empty preview'];
@@ -733,6 +803,7 @@ export function previewQualityIssues(result, context) {
     )) {
         issues.push('translation-list overview is not mapped to meanings');
     }
+    issues.push(...duplicateMeaningIssues(result));
     return issues;
 }
 
@@ -1044,6 +1115,7 @@ export function coreQualityIssues(result, context) {
             }
         }
     }
+    issues.push(...duplicateMeaningIssues(result));
     if (!bilingualHasContent(result.usageWarnings, definitionsOnly, true)) issues.push('invalid usage-warnings section');
     if (!bilingualHasContent(result.grammarNotes, definitionsOnly, true)) issues.push('invalid grammar-notes section');
     if (!Array.isArray(result.regionalVariants) || !Array.isArray(result.wordFamily) || !Array.isArray(result.minimalPairs)) {
@@ -1145,7 +1217,9 @@ First decide whether the exact input is genuinely established in requested sourc
 
 Validation fields must be internally consistent. validLanguages is supporting evidence and need not be exhaustive. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish. If existsInRequestedLanguage=false, leave partOfSpeech, formality, mainTranslation, pronunciationGuide and meanings empty. Do not translate a source-language mismatch.
 
-For an accepted entry, identify every established, practically useful grammatical class and distinct common sense. Return every class in partOfSpeech and a separate meanings item for every useful sense, each with a natural semantic label, exact English partOfSpeech, register, concise ${fromName} sourceDefinition, ${definitionsOnly ? 'an empty targetDefinition and empty translations' : `a faithful ${toName} targetDefinition and all appropriate ${toName} translations`}. Do not stop after the first sense and do not shorten the result into a teaser. mainTranslation must be the de-duplicated union of every translation under meanings, and every mainTranslation item must appear under its correct meaning. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. Use natural semantic labels such as "Physical movement", never machine keys such as verb_connect.
+For an accepted entry, identify every established, practically useful grammatical class and distinct common sense. Return every class in partOfSpeech and a separate meanings item for every useful sense, each with a natural semantic label, exact English partOfSpeech, register, concise ${fromName} sourceDefinition, ${definitionsOnly ? 'an empty targetDefinition and empty translations' : `a faithful ${toName} targetDefinition and all appropriate ${toName} translations`}. Do not stop after the first sense and do not shorten the result into a teaser. Before answering, explicitly audit noun, verb, adjective, adverb, interjection, idiom, specialist-domain and proper-name uses, retaining only genuinely established ones. For a single alphabetic word, do not let a famous capitalised name suppress ordinary lowercase lexical uses or let an ordinary word suppress a genuine proper-name use. For example, English "trump" to French must cover the surname/name "Trump", the card or figurative noun "atout", the card-game verb "couper", and the verbs meaning "surpasser" or "l’emporter sur"; returning only "Trump" is incomplete.
+
+mainTranslation must be the de-duplicated union of every translation under meanings, and every mainTranslation item must appear under its correct meaning. Never repeat two meanings with the same semantic label and the same explanation. If a multiword input is a plausible literal phrase, return each distinct established or compositional meaning once; if it is instead a clear near-miss for a common expression, use suggestedCorrection rather than inventing duplicate senses. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. Use natural semantic labels such as "Physical movement", never machine keys such as verb_connect.
 
 Return one concise pronunciationGuide containing only the pronunciation of the exact source entry in ${fromName}; never include the destination-language pronunciation, a bilingual pronunciation pair, or labels such as "(EN)" and "(FR)". Use concise English grammatical labels. Use only these registers: ${REGISTER_VALUES.join(', ')}.
 
@@ -1208,6 +1282,97 @@ Use supported language codes only: ${Object.keys(LANGUAGES).join(', ')}. Return 
             maxOutputTokens:16384
         }
     };
+}
+
+function detailsDraftFromCore(result) {
+    const source = result || {};
+    return {
+        learningMetadata:source.learningMetadata,
+        etymology:source.etymology,
+        definitions:source.definitions,
+        synonyms:source.synonyms,
+        antonyms:source.antonyms,
+        similarPhrases:source.similarPhrases,
+        collocations:source.collocations,
+        usageWarnings:source.usageWarnings,
+        grammarNotes:source.grammarNotes,
+        regionalVariants:source.regionalVariants,
+        wordFamily:source.wordFamily,
+        minimalPairs:source.minimalPairs
+    };
+}
+
+export function buildDetailsRequest(context, translationList, { repairSource = null } = {}) {
+    const fromName = LANGUAGES[cleanCode(context.fromLang)];
+    const toName = LANGUAGES[cleanCode(context.toLang)];
+    const definitionsOnly = context.definitionsOnly === true;
+    const list = normalizePreviewResult(translationList, context);
+    const repairInstruction = repairSource
+        ? `\nRepair these detail-section defects: ${repairSource.issues.join('; ')}.\nCurrent detail draft:\n${JSON.stringify(detailsDraftFromCore(repairSource.result))}`
+        : '';
+    const system = `You are Qelumi's dictionary-detail augmentation engine. The authoritative translation list below has already been validated and displayed. Do not regenerate, remove, rename, merge or contradict its meanings, grammatical classes, definitions or translations. Return only the remaining fields required by the compact detail schema.
+
+AUTHORITATIVE TRANSLATION LIST:
+${JSON.stringify(list)}
+
+ETYMOLOGY: both fields describe the exact source entry "${context.query}" in ${fromName}, never a destination translation. Write sourceLang entirely in ${fromName}. ${definitionsOnly ? 'Keep targetLang empty.' : `Write targetLang entirely in ${toName} as a faithful translation of the same facts.`} Give two to four concise informative sentences when reliable, and state uncertainty instead of inventing facts.
+
+DEFINITIONS AND RELATIONS: definitions must faithfully consolidate the already supplied meanings without adding or dropping a sense. Return useful established synonyms in both languages. Return genuine antonyms only when responsible: status="available" with both arrays, otherwise status="no-direct-antonym" with both arrays empty. similarPhrases and collocations must contain distinct natural phrases rather than duplicate copies. usageWarnings and grammarNotes are valid arrays and may be empty when there is genuinely nothing useful to add. regionalVariants, wordFamily and minimalPairs are optional-content containers: return [] rather than inventing entries.
+
+LEARNING METADATA: provide a realistic CEFR estimate, practical frequency band, spoken/written modality and concise source guidance. ${definitionsOnly ? 'Keep targetNote empty.' : `Write targetNote in ${toName}.`}
+
+${definitionsOnly ? `This is definitions-only mode. Keep every target-language array and target field empty. Write source content only in ${fromName}.` : `Source fields are in ${fromName}; target fields are in ${toName}.`}
+
+Return strict JSON matching only the supplied detail schema.${repairInstruction}`;
+    return {
+        contents:[{ role:'user', parts:[{ text:`Complete the remaining dictionary details for exact source entry: ${context.query}` }] }],
+        systemInstruction:{ parts:[{ text:system }] },
+        generationConfig:{
+            responseMimeType:'application/json',
+            responseJsonSchema:DETAILS_RESPONSE_SCHEMA,
+            maxOutputTokens:7000
+        }
+    };
+}
+
+export function composeCoreFromTranslationList(translationList, details, conjugationGroups, context) {
+    const list = normalizePreviewResult(translationList, context);
+    if (!list?.sourceLanguageValidation?.existsInRequestedLanguage || !list.wordExists) {
+        return normalizeTranslationResult(list, context);
+    }
+    const derivedDefinitions = {
+        sourceLang:(list.meanings || []).map(meaning => meaning.sourceDefinition).filter(Boolean),
+        targetLang:context.definitionsOnly
+            ? []
+            : (list.meanings || []).map(meaning => meaning.targetDefinition).filter(Boolean)
+    };
+    return normalizeTranslationResult({
+        detectedSourceLang:list.detectedSourceLang,
+        sourceLanguageValidation:list.sourceLanguageValidation,
+        wordExists:true,
+        suggestedCorrection:list.suggestedCorrection,
+        extractedText:'',
+        partOfSpeech:list.partOfSpeech,
+        formality:list.formality,
+        learningMetadata:details?.learningMetadata,
+        mainTranslation:list.mainTranslation,
+        pronunciationGuide:list.pronunciationGuide,
+        etymology:details?.etymology,
+        isVerb:(list.meanings || []).some(meaning => /\bverb\b/iu.test(meaning.partOfSpeech || '')),
+        conjugationGroups:Array.isArray(conjugationGroups) ? conjugationGroups : [],
+        definitions:details?.definitions || derivedDefinitions,
+        synonyms:details?.synonyms,
+        antonyms:details?.antonyms,
+        similarPhrases:details?.similarPhrases,
+        meanings:list.meanings,
+        collocations:details?.collocations,
+        usageWarnings:details?.usageWarnings,
+        grammarNotes:details?.grammarNotes,
+        regionalVariants:details?.regionalVariants,
+        wordFamily:details?.wordFamily,
+        minimalPairs:details?.minimalPairs,
+        contexts:[]
+    }, context);
 }
 
 function conjugationResponseSchema(context) {
@@ -1717,15 +1882,17 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     function cacheCoreEnvelope(context, result, metadata = {}) {
         if (!result) return;
+        const envelopeSchemaVersion = Number(metadata.schemaVersion || DICTIONARY_SCHEMA_VERSION);
         l1Cache.set(dictionaryCacheKey('core', context), {
             result,
-            schemaVersion:Number(metadata.schemaVersion || DICTIONARY_SCHEMA_VERSION),
+            schemaVersion:envelopeSchemaVersion,
             updatedAt:Number(metadata.updatedAt || Date.now()),
             expiresAt:Number(metadata.expiresAt || 0),
             staleUntil:Number(metadata.staleUntil || 0)
         }, cacheTtlForResult(result));
         const preview = previewFromCore(result, context);
-        if (previewQualityIssues(preview, context).length === 0) {
+        if (envelopeSchemaVersion >= DICTIONARY_SCHEMA_VERSION
+            && previewQualityIssues(preview, context).length === 0) {
             l1Cache.set(dictionaryCacheKey('preview', context), {
                 preview,
                 updatedAt:Number(metadata.updatedAt || Date.now()),
@@ -1782,9 +1949,12 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function saveCachedResult(context, result, metadata = {}) {
         const ref = dictionaryRef(context);
-        const previousSnapshot = await readDictionary(ref, 'Dictionary merge lookup');
-        const previous = parseStored(previousSnapshot, context)?.result;
-        const merged = metadata.preserveExamples === false ? result : mergeContextExamples(clone(result), previous);
+        let merged = result;
+        if (metadata.preserveExamples !== false) {
+            const previousSnapshot = await readDictionary(ref, 'Dictionary merge lookup');
+            const previous = parseStored(previousSnapshot, context)?.result;
+            merged = mergeContextExamples(clone(result), previous);
+        }
         const now = Date.now();
         const contextsComplete = contextsAreComplete(merged, context);
         const accepted = merged?.sourceLanguageValidation?.existsInRequestedLanguage === true && merged.wordExists === true;
@@ -1840,7 +2010,11 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             });
             const contradictions = rawLanguageContradictions(primary.result, context.fromLang);
             result = normalizePreviewResult(primary.result, context);
-            issues = previewQualityIssues(result, context);
+            issues = [
+                ...previewQualityIssues(result, context),
+                ...duplicateMeaningIssues(primary.result),
+                ...primaryTranslationListCoverageRisks(result, context)
+            ];
             const ambiguous = isGenuinelyAmbiguous(result);
             if (contradictions.length || ambiguous) {
                 issues.push(...contradictions, ...(ambiguous ? ['genuine language ambiguity'] : []));
@@ -1868,7 +2042,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 metrics:{ fromLang:context.fromLang, toLang:context.toLang }
             });
             result = normalizePreviewResult(fallback.result, context);
-            issues = previewQualityIssues(result, context);
+            issues = [
+                ...previewQualityIssues(result, context),
+                ...duplicateMeaningIssues(fallback.result)
+            ];
             fallbackReason = fallbackReason || `preview_quality:${repairIssues.join('|')}`;
         }
 
@@ -1942,11 +2119,13 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         if (cachedCore?.result) {
             cacheStoredCore(context, cachedCore);
             const age = cachedCore.updatedAt ? now - cachedCore.updatedAt : Infinity;
+            const cachedSchemaVersion = Number(cachedCore.stored?.schemaVersion || 0);
             const accepted = cachedCore.result?.sourceLanguageValidation?.existsInRequestedLanguage === true
                 && cachedCore.result.wordExists === true;
             const negativeExpiry = Number(cachedCore.stored?.expiresAt || 0);
             const derived = previewFromCore(cachedCore.result, context);
-            if (age <= staleTtlMs && (accepted || negativeExpiry > now)
+            if (cachedSchemaVersion >= DICTIONARY_SCHEMA_VERSION
+                && age <= staleTtlMs && (accepted || negativeExpiry > now)
                 && previewQualityIssues(derived, context).length === 0) {
                 recordUsage(uid, 'translation_preview_cache_hit', {
                     cacheStatus:'full_dictionary', cacheLookupMs, latencyMs:cacheLookupMs,
@@ -2015,7 +2194,226 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         };
     }
 
+    const isConjugationQualityIssue = issue =>
+        issue === 'missing language-specific conjugations'
+        || issue.startsWith('incomplete conjugation coverage:')
+        || issue === 'conjugation entries must each represent one tense or form'
+        || issue.startsWith('duplicate conjugation coverage:');
+
+    const modelCallSummary = call => ({
+        model:call.model,
+        thinkingLevel:call.thinkingLevel,
+        latencyMs:call.latencyMs,
+        schemaFallbackUsed:call.schemaFallbackUsed === true,
+        compatibilityMode:call.compatibilityMode,
+        compatibilityRetries:call.compatibilityRetries,
+        ...call.tokens
+    });
+
+    async function generateCoreFromTranslationList(context, uid, prior, translationListSeed) {
+        const totalStart = performance.now();
+        const list = normalizePreviewResult(translationListSeed, context);
+        const listIssues = [
+            ...previewQualityIssues(list, context),
+            ...duplicateMeaningIssues(list)
+        ];
+        if (listIssues.length) {
+            const error = new Error(`The authoritative translation list cannot be expanded: ${listIssues.join(', ')}.`);
+            error.status = 502;
+            error.code = 'TRANSLATION_LIST_INCOMPLETE';
+            throw error;
+        }
+
+        const accepted = list.sourceLanguageValidation?.existsInRequestedLanguage === true
+            && list.wordExists === true;
+        if (!accepted) {
+            let result = composeCoreFromTranslationList(list, {}, [], context);
+            result = await saveCachedResult(context, result, {
+                model:'translation-list',
+                fallbackUsed:false,
+                preserveExamples:false
+            });
+            return {
+                result,
+                meta:{
+                    source:'generated',
+                    cacheStatus:'miss',
+                    schemaVersion:DICTIONARY_SCHEMA_VERSION,
+                    primaryModel:PRIMARY_MODEL,
+                    primaryThinking:PRIMARY_THINKING,
+                    fallbackModel:FALLBACK_MODEL,
+                    fallbackThinking:FALLBACK_THINKING,
+                    fallbackUsed:false,
+                    fallbackReason:'',
+                    contextsReady:true,
+                    latencyMs:Math.round(performance.now() - totalStart),
+                    modelCalls:[]
+                }
+            };
+        }
+
+        let detailPrimary;
+        let detailFallback;
+        let conjugationPrimary;
+        let conjugationFallback;
+        const fallbackReasons = [];
+        const verbal = list.meanings.some(meaning => /\bverb\b/iu.test(meaning.partOfSpeech || ''))
+            || /\bverb\b/iu.test(list.partOfSpeech || '');
+
+        const detailPromise = (async () => {
+            let details;
+            let detailIssues = [];
+            try {
+                detailPrimary = await modelJSON({
+                    model:PRIMARY_MODEL,
+                    thinkingLevel:PRIMARY_THINKING,
+                    body:buildDetailsRequest(context, list),
+                    timeoutMs:primaryTimeoutMs,
+                    operation:'translation_details_primary',
+                    uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                details = detailPrimary.result;
+                const candidate = composeCoreFromTranslationList(list, details, [], context);
+                detailIssues = coreQualityIssues(candidate, context)
+                    .filter(issue => !isConjugationQualityIssue(issue));
+            } catch (error) {
+                detailIssues = [`primary details: ${error.code || error.message || 'failed'}`];
+            }
+
+            if (!details || detailIssues.length) {
+                fallbackReasons.push(`details:${detailIssues.join('|') || 'primary_failed'}`);
+                detailFallback = await modelJSON({
+                    model:FALLBACK_MODEL,
+                    thinkingLevel:FALLBACK_THINKING,
+                    body:buildDetailsRequest(context, list, details ? {
+                        repairSource:{
+                            result:composeCoreFromTranslationList(list, details, [], context),
+                            issues:detailIssues
+                        }
+                    } : undefined),
+                    timeoutMs:fallbackTimeoutMs,
+                    operation:'translation_details_fallback',
+                    uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                details = detailFallback.result;
+                const repaired = composeCoreFromTranslationList(list, details, [], context);
+                detailIssues = coreQualityIssues(repaired, context)
+                    .filter(issue => !isConjugationQualityIssue(issue));
+            }
+
+            if (detailIssues.length) {
+                const error = new Error(`The dictionary details were incomplete: ${detailIssues.join(', ')}.`);
+                error.status = 502;
+                error.code = 'DETAILS_INCOMPLETE';
+                throw error;
+            }
+            return details;
+        })();
+
+        const conjugationPromise = (async () => {
+            if (!verbal) return [];
+            const candidate = composeCoreFromTranslationList(list, {}, [], context);
+            let groups = [];
+            let conjugationIssues = ['missing language-specific conjugations'];
+            try {
+                conjugationPrimary = await modelJSON({
+                    model:PRIMARY_MODEL,
+                    thinkingLevel:PRIMARY_THINKING,
+                    body:buildConjugationRepairRequest(context, candidate, conjugationIssues),
+                    timeoutMs:primaryTimeoutMs,
+                    operation:'translation_conjugations_primary',
+                    uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                const normalized = composeCoreFromTranslationList(
+                    list,
+                    {},
+                    conjugationPrimary.result?.conjugationGroups,
+                    context
+                );
+                groups = normalized.conjugationGroups;
+                conjugationIssues = conjugationCoverageIssues(normalized, context);
+            } catch (error) {
+                conjugationIssues = [`primary conjugations: ${error.code || error.message || 'failed'}`];
+            }
+
+            if (conjugationIssues.length) {
+                fallbackReasons.push(`conjugations:${conjugationIssues.join('|')}`);
+                const repairCandidate = composeCoreFromTranslationList(list, {}, groups, context);
+                conjugationFallback = await modelJSON({
+                    model:FALLBACK_MODEL,
+                    thinkingLevel:FALLBACK_THINKING,
+                    body:buildConjugationRepairRequest(context, repairCandidate, conjugationIssues),
+                    timeoutMs:fallbackTimeoutMs,
+                    operation:'translation_conjugations_fallback',
+                    uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                const repaired = composeCoreFromTranslationList(
+                    list,
+                    {},
+                    conjugationFallback.result?.conjugationGroups,
+                    context
+                );
+                groups = repaired.conjugationGroups;
+                conjugationIssues = conjugationCoverageIssues(repaired, context);
+            }
+
+            if (conjugationIssues.length) {
+                const error = new Error(`The conjugation paradigms were incomplete: ${conjugationIssues.join(', ')}.`);
+                error.status = 502;
+                error.code = 'CONJUGATIONS_INCOMPLETE';
+                throw error;
+            }
+            return groups;
+        })();
+
+        const [details, conjugationGroups] = await Promise.all([detailPromise, conjugationPromise]);
+        let result = composeCoreFromTranslationList(list, details, conjugationGroups, context);
+        const issues = coreQualityIssues(result, context);
+        if (issues.length) {
+            const error = new Error(`The linguistic response was incomplete: ${issues.join(', ')}.`);
+            error.status = 502;
+            error.code = 'MODEL_SCHEMA_INCOMPLETE';
+            throw error;
+        }
+        if (prior) result = mergeContextExamples(result, prior);
+
+        const calls = [detailPrimary, detailFallback, conjugationPrimary, conjugationFallback].filter(Boolean);
+        const fallbackUsed = !!detailFallback || !!conjugationFallback;
+        const fallbackReason = fallbackReasons.join(',');
+        result = await saveCachedResult(context, result, {
+            model:calls[0]?.model || PRIMARY_MODEL,
+            fallbackModel:fallbackUsed ? FALLBACK_MODEL : '',
+            fallbackUsed,
+            fallbackReason,
+            preserveExamples:false
+        });
+        return {
+            result,
+            meta:{
+                source:prior ? 'dictionary_repair' : 'generated',
+                cacheStatus:'miss',
+                schemaVersion:DICTIONARY_SCHEMA_VERSION,
+                primaryModel:PRIMARY_MODEL,
+                primaryThinking:PRIMARY_THINKING,
+                fallbackModel:FALLBACK_MODEL,
+                fallbackThinking:FALLBACK_THINKING,
+                fallbackUsed,
+                fallbackReason,
+                contextsReady:contextsAreComplete(result, context),
+                latencyMs:Math.round(performance.now() - totalStart),
+                modelCalls:calls.map(modelCallSummary)
+            }
+        };
+    }
+
     async function generateCore(context, uid, prior = null, translationListSeed = null) {
+        if (translationListSeed) {
+            return generateCoreFromTranslationList(context, uid, prior, translationListSeed);
+        }
         const totalStart = performance.now();
         let primary; let primaryParsed; let primaryError; let fallbackReason = '';
         let conjugationRepair;
@@ -2186,6 +2584,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         const age = cached?.updatedAt ? Date.now() - cached.updatedAt : Infinity;
         const cachedSchemaVersion = Number(cached?.stored?.schemaVersion || 0);
         const needsSchemaRefresh = cachedSchemaVersion < DICTIONARY_SCHEMA_VERSION;
+        const currentTranslationListSeed = l1Cache.get(dictionaryCacheKey('preview', context))?.preview || null;
         const upgradeOnlyIssues = new Set([
             'invalid learning metadata', 'missing source learning note', 'missing target learning note',
             'missing antonym decision'
@@ -2218,9 +2617,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:cacheOrigin === 'render_l1' ? 'l1' : 'fresh', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
         }
 
-        if (!forceRefresh && cacheUsable && age <= staleTtlMs) {
+        if (!forceRefresh && cacheUsable && age <= staleTtlMs
+            && !(needsSchemaRefresh && currentTranslationListSeed)) {
             const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
-            const listSeed = l1Cache.get(dictionaryCacheKey('preview', context))?.preview || previewFromCore(cached.result, context);
+            const listSeed = currentTranslationListSeed || previewFromCore(cached.result, context);
             singleFlight(coreFlights, flightKey, () => generateCore(context, 'stale-refresh', cached.result, listSeed))
                 .catch(error => console.warn('Stale dictionary refresh failed.', error.message));
             if (touch) {
@@ -2236,7 +2636,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         }
 
         const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
-        const translationListSeed = l1Cache.get(dictionaryCacheKey('preview', context))?.preview || null;
+        const translationListSeed = currentTranslationListSeed;
         const generated = await singleFlight(coreFlights, flightKey, () => generateCore(context, uid, cached?.result, translationListSeed));
         generated.meta.cacheLookupMs = cacheLookupMs;
         generated.meta.latencyMs = Math.round(performance.now() - started);
@@ -2281,6 +2681,37 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         };
     }
 
+    async function generateContextBatch(context, coreResult, uid) {
+        const count = examplesPerContext(coreResult.contexts.length);
+        const generated = await Promise.all(
+            coreResult.contexts.map(item => generateContextExamples(context, coreResult, item, count, uid))
+        );
+        return {
+            contexts:generated.map(item => item.context),
+            fallbackUsed:generated.some(item => item.fallbackUsed),
+            fallbackReason:generated
+                .filter(item => item.fallbackReason)
+                .map(item => item.fallbackReason)
+                .join(','),
+            modelCalls:generated.flatMap(item => item.modelCalls).map(modelCallSummary)
+        };
+    }
+
+    function contextBatchFlightKey(context, coreResult) {
+        const meaningContract = (coreResult?.meanings || []).map(meaning => ({
+            label:meaning.label,
+            partOfSpeech:meaning.partOfSpeech,
+            register:meaning.register,
+            sourceDefinition:meaning.sourceDefinition,
+            targetDefinition:meaning.targetDefinition
+        }));
+        const signature = crypto.createHash('sha256')
+            .update(JSON.stringify(meaningContract))
+            .digest('hex')
+            .slice(0, 16);
+        return `${dictionaryIdentity(context.query, context.fromLang, context.toLang)}|context-batch|${signature}`;
+    }
+
     async function getContexts(context, uid) {
         const started = performance.now();
         const coreResponse = await getCore(context, uid, { touch:false });
@@ -2291,31 +2722,131 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         if (contextsAreComplete(coreResult, context)) {
             return { contexts:coreResult.contexts, meta:{ source:'global_dictionary', cacheStatus:'fresh', contextsReady:true, latencyMs:Math.round(performance.now() - started), fallbackUsed:false, modelCalls:[] } };
         }
-        const key = `${dictionaryIdentity(context.query, context.fromLang, context.toLang)}|contexts`;
-        return singleFlight(exampleFlights, key, async () => {
-            const count = examplesPerContext(coreResult.contexts.length);
-            const generated = await Promise.all(coreResult.contexts.map(item => generateContextExamples(context, coreResult, item, count, uid)));
-            const completed = { ...coreResult, contexts:generated.map(item => item.context) };
-            const saved = await saveCachedResult(context, completed, {
-                model:PRIMARY_MODEL, fallbackModel:generated.some(item => item.fallbackUsed) ? FALLBACK_MODEL : '',
-                fallbackUsed:generated.some(item => item.fallbackUsed),
-                fallbackReason:generated.filter(item => item.fallbackReason).map(item => item.fallbackReason).join(','),
-                preserveExamples:false, incrementUse:false
-            });
-            const calls = generated.flatMap(item => item.modelCalls).map(call => ({
-                model:call.model, thinkingLevel:call.thinkingLevel, latencyMs:call.latencyMs,
-                schemaFallbackUsed:call.schemaFallbackUsed === true,
-                compatibilityMode:call.compatibilityMode, compatibilityRetries:call.compatibilityRetries,
-                ...call.tokens
-            }));
-            return {
-                contexts:saved.contexts,
-                meta:{ source:'generated', cacheStatus:'miss', contextsReady:true,
-                    fallbackUsed:generated.some(item => item.fallbackUsed),
-                    fallbackReason:generated.filter(item => item.fallbackReason).map(item => item.fallbackReason).join(','),
-                    latencyMs:Math.round(performance.now() - started), modelCalls:calls }
-            };
+        const key = contextBatchFlightKey(context, coreResult);
+        const batch = await singleFlight(exampleFlights, key, () => generateContextBatch(context, coreResult, uid));
+        const completed = { ...coreResult, contexts:batch.contexts };
+        const saved = await saveCachedResult(context, completed, {
+            model:PRIMARY_MODEL,
+            fallbackModel:batch.fallbackUsed ? FALLBACK_MODEL : '',
+            fallbackUsed:batch.fallbackUsed,
+            fallbackReason:batch.fallbackReason,
+            preserveExamples:false,
+            incrementUse:false
         });
+        return {
+            contexts:saved.contexts,
+            meta:{
+                source:'generated',
+                cacheStatus:'miss',
+                contextsReady:true,
+                fallbackUsed:batch.fallbackUsed,
+                fallbackReason:batch.fallbackReason,
+                latencyMs:Math.round(performance.now() - started),
+                modelCalls:batch.modelCalls
+            }
+        };
+    }
+
+    async function getCompleteDetails(context, uid, { forceRefresh = false } = {}) {
+        const started = performance.now();
+        if (forceRefresh) invalidateContext(context);
+
+        const listResponse = await getPreview(context, uid);
+        const list = listResponse.preview;
+        const seedCore = composeCoreFromTranslationList(list, {}, [], context);
+        const accepted = seedCore?.sourceLanguageValidation?.existsInRequestedLanguage === true
+            && seedCore.wordExists === true;
+
+        const currentCoreEnvelope = l1Cache.get(dictionaryCacheKey('core', context));
+        const currentCore = currentCoreEnvelope?.result;
+        if (!forceRefresh
+            && Number(currentCoreEnvelope?.schemaVersion || 0) >= DICTIONARY_SCHEMA_VERSION
+            && currentCore
+            && contextsAreComplete(currentCore, context)
+            && coreQualityIssues(currentCore, context).length === 0) {
+            const cachedResponse = await getCore(context, uid);
+            return {
+                result:cachedResponse.result,
+                meta:{
+                    ...cachedResponse.meta,
+                    contextsReady:true,
+                    latencyMs:Math.round(performance.now() - started),
+                    modelCalls:cachedResponse.meta?.modelCalls || []
+                }
+            };
+        }
+
+        const corePromise = getCore(context, uid, { forceRefresh:false });
+        let batchPromise = Promise.resolve(null);
+        if (accepted && seedCore.contexts.length) {
+            const key = contextBatchFlightKey(context, seedCore);
+            batchPromise = singleFlight(exampleFlights, key, () => generateContextBatch(context, seedCore, uid));
+        }
+
+        const [coreResponse, batch] = await Promise.all([corePromise, batchPromise]);
+        let result = coreResponse.result;
+        if (!accepted || !result?.sourceLanguageValidation?.existsInRequestedLanguage || !result.wordExists) {
+            return {
+                result,
+                meta:{
+                    ...coreResponse.meta,
+                    contextsReady:true,
+                    latencyMs:Math.round(performance.now() - started)
+                }
+            };
+        }
+
+        if (!contextsAreComplete(result, context)) {
+            if (!batch) {
+                const key = contextBatchFlightKey(context, result);
+                const generated = await singleFlight(
+                    exampleFlights,
+                    key,
+                    () => generateContextBatch(context, result, uid)
+                );
+                result = normalizeTranslationResult({ ...result, contexts:generated.contexts }, context);
+                result = await saveCachedResult(context, result, {
+                    model:PRIMARY_MODEL,
+                    fallbackModel:generated.fallbackUsed ? FALLBACK_MODEL : '',
+                    fallbackUsed:generated.fallbackUsed,
+                    fallbackReason:generated.fallbackReason,
+                    preserveExamples:false,
+                    incrementUse:false
+                });
+                return {
+                    result,
+                    meta:{
+                        ...coreResponse.meta,
+                        contextsReady:true,
+                        fallbackUsed:coreResponse.meta?.fallbackUsed || generated.fallbackUsed,
+                        fallbackReason:[coreResponse.meta?.fallbackReason, generated.fallbackReason].filter(Boolean).join(','),
+                        latencyMs:Math.round(performance.now() - started),
+                        modelCalls:[...(coreResponse.meta?.modelCalls || []), ...generated.modelCalls]
+                    }
+                };
+            }
+            result = normalizeTranslationResult({ ...result, contexts:batch.contexts }, context);
+            result = await saveCachedResult(context, result, {
+                model:PRIMARY_MODEL,
+                fallbackModel:batch.fallbackUsed ? FALLBACK_MODEL : '',
+                fallbackUsed:batch.fallbackUsed,
+                fallbackReason:batch.fallbackReason,
+                preserveExamples:false,
+                incrementUse:false
+            });
+        }
+
+        return {
+            result,
+            meta:{
+                ...coreResponse.meta,
+                contextsReady:contextsAreComplete(result, context),
+                fallbackUsed:coreResponse.meta?.fallbackUsed || batch?.fallbackUsed || false,
+                fallbackReason:[coreResponse.meta?.fallbackReason, batch?.fallbackReason].filter(Boolean).join(','),
+                latencyMs:Math.round(performance.now() - started),
+                modelCalls:[...(coreResponse.meta?.modelCalls || []), ...(batch?.modelCalls || [])]
+            }
+        };
     }
 
     async function getDistractors(context, uid) {
@@ -2359,7 +2890,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     }
 
     return {
-        getPreview, getTranslationList, getCore, getContexts, getDistractors, saveCachedResult,
+        getPreview, getTranslationList, getCore, getContexts, getCompleteDetails, getDistractors, saveCachedResult,
         invalidateContext,
         invalidateDocumentId,
         clearL1Cache:() => l1Cache.clear(),

@@ -17,7 +17,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.8.0';
+const BACKEND_VERSION = '4.8.1';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -571,6 +571,8 @@ app.get('/health', (_req, res) => res.json({
         enabled:true,
         mode:'complete-list-then-on-demand-details',
         previewRendering:false,
+        compactDetailAugmentation:true,
+        parallelMeaningExamples:true,
         translationListSchemaVersion:TRANSLATION_LIST_SCHEMA_VERSION,
         legacyPreviewSchemaVersion:PREVIEW_SCHEMA_VERSION
     },
@@ -857,6 +859,17 @@ app.post('/api/translate/list', requireUser, rateLimit({ windowMs:60 * 60_000, m
         res.json(await translationService.getTranslationList(context, req.user.uid));
     } catch (error) {
         res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_LIST_FAILED' } });
+    }
+});
+
+app.post('/api/translate/details', requireUser, rateLimit({ windowMs:60 * 60_000, max:120, key:req => `translation-details:${req.user.uid}` }), async (req, res) => {
+    try {
+        const context = translationContext(req.body);
+        const forceRefresh = req.body?.forceRefresh === true
+            && (req.user.uid === ADMIN_UID || req.user.admin === true);
+        res.json(await translationService.getCompleteDetails(context, req.user.uid, { forceRefresh }));
+    } catch (error) {
+        res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_DETAILS_FAILED' } });
     }
 });
 
