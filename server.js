@@ -17,7 +17,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.8.2';
+const BACKEND_VERSION = '4.8.3';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -361,11 +361,11 @@ function liveTranslationRequest(text, sourceLang, targetLang) {
         ? `Detect the source language and return its supported ISO code from: ${Object.keys(LANGUAGES).join(', ')}.`
         : `The source language is ${LANGUAGES[sourceLang]} (${sourceLang}). Return ${sourceLang} as sourceLang.`;
     return {
-        systemInstruction:{ parts:[{ text:`You are Qelumi's live conversation interpreter. ${sourceInstruction} Translate the complete spoken message naturally into ${targetName} (${targetLang}). Preserve meaning, tone, politeness, names, numbers and register. Do not explain, censor, expand or answer the message. Return strict JSON only.` }] },
-        contents:[{ role:'user', parts:[{ text:`Spoken message:\n${text}` }] }],
+        systemInstruction:{ parts:[{ text:`You are Qelumi's faithful text and conversation translator. ${sourceInstruction} Translate the complete supplied text naturally into ${targetName} (${targetLang}). Preserve every paragraph's meaning, tone, politeness, names, numbers, register and line structure. Do not explain, censor, expand or answer the text. Return strict JSON only.` }] },
+        contents:[{ role:'user', parts:[{ text:`Text to translate:\n${text}` }] }],
         generationConfig:{
             responseMimeType:'application/json',
-            maxOutputTokens:2048,
+            maxOutputTokens:8192,
             responseSchema:{
                 type:'OBJECT',
                 properties:{
@@ -379,7 +379,11 @@ function liveTranslationRequest(text, sourceLang, targetLang) {
 }
 
 async function translateLiveText({ text, sourceLang, targetLang }, uid) {
-    const cleanMessage = String(text || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').slice(0, 1500);
+    const cleanMessage = String(text || '').normalize('NFKC').trim()
+        .replace(/\r\n?/gu, '\n')
+        .replace(/[^\S\n]+/gu, ' ')
+        .replace(/\n{3,}/gu, '\n\n')
+        .slice(0, 8000);
     const source = String(sourceLang || 'AUTO').trim().toUpperCase();
     const target = String(targetLang || '').trim().toUpperCase();
     if (!cleanMessage) throw Object.assign(new Error('A spoken or typed message is required.'), { status:400 });
@@ -390,7 +394,7 @@ async function translateLiveText({ text, sourceLang, targetLang }, uid) {
     let data; let result; let model = PRIMARY_MODEL; let thinkingLevel = PRIMARY_THINKING;
     let operation = 'live_translation_primary'; let started = performance.now(); let fallbackUsed = false;
     try {
-        data = await callGemini(body, { model, thinkingLevel, timeoutMs:20_000 });
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:30_000 });
         result = parseGeminiJSON(data);
         if (!LANGUAGES[result?.sourceLang] || !String(result?.translatedText || '').trim()) throw new Error('The live translation was incomplete.');
     } catch (primaryError) {
@@ -401,7 +405,7 @@ async function translateLiveText({ text, sourceLang, targetLang }, uid) {
         }).catch(() => {});
         fallbackUsed = true; model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
         operation = 'live_translation_fallback'; started = performance.now();
-        data = await callGemini(body, { model, thinkingLevel, timeoutMs:30_000 });
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:45_000 });
         result = parseGeminiJSON(data);
     }
     const detectedSource = source === 'AUTO' ? String(result?.sourceLang || '').toUpperCase() : source;
@@ -591,7 +595,11 @@ app.get('/health', (_req, res) => res.json({
         seamlessDetailReveal:true,
         meaningAlignedContextExamples:true,
         liveInterimTranscription:true,
+        deduplicatedLiveTranscription:true,
         editableTranscriptTranslation:true,
+        textTranslation:true,
+        textTranslationAutoDetect:true,
+        longTextTranslation:true,
         persistentSaveFeedback:true,
         stickyTranslationSearch:true,
         bilingualAntonyms:true
