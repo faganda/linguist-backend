@@ -17,7 +17,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.8.1';
+const BACKEND_VERSION = '4.8.2';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -435,7 +435,7 @@ function parseLiveAudioData(value) {
     const byteLength = Buffer.from(data, 'base64').length;
     if (byteLength < 32) throw Object.assign(new Error('No usable audio was captured.'), { status:400 });
     if (byteLength > 6 * 1024 * 1024) {
-        throw Object.assign(new Error('That recording is too large. Record no more than 45 seconds at a time.'), { status:413 });
+        throw Object.assign(new Error('That recording is too large. Record no more than 3 minutes at a time.'), { status:413 });
     }
     return {mimeType, data};
 }
@@ -468,7 +468,7 @@ async function transcribeLiveAudio(audioData, uid) {
     let data; let result; let model = PRIMARY_MODEL; let thinkingLevel = PRIMARY_THINKING;
     let operation = 'live_transcription_primary'; let started = performance.now(); let fallbackUsed = false;
     try {
-        data = await callGemini(body, { model, thinkingLevel, timeoutMs:30_000 });
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:60_000 });
         result = parseGeminiJSON(data);
         if (!LANGUAGES[result?.sourceLang] || !String(result?.transcript || '').trim()) {
             throw new Error('No clear speech was recognised in that recording.');
@@ -481,7 +481,7 @@ async function transcribeLiveAudio(audioData, uid) {
         }).catch(() => {});
         fallbackUsed = true; model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
         operation = 'live_transcription_fallback'; started = performance.now();
-        data = await callGemini(body, { model, thinkingLevel, timeoutMs:40_000 });
+        data = await callGemini(body, { model, thinkingLevel, timeoutMs:90_000 });
         result = parseGeminiJSON(data);
     }
     const sourceLang = String(result?.sourceLang || '').toUpperCase();
@@ -588,7 +588,11 @@ app.get('/health', (_req, res) => res.json({
         normalizedAndroidVoiceLocales:true,
         completeTranslationFirst:true,
         onDemandTranslationDetails:true,
+        seamlessDetailReveal:true,
         meaningAlignedContextExamples:true,
+        liveInterimTranscription:true,
+        editableTranscriptTranslation:true,
+        persistentSaveFeedback:true,
         stickyTranslationSearch:true,
         bilingualAntonyms:true
     },
