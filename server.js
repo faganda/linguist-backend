@@ -17,7 +17,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.8.7';
+const BACKEND_VERSION = '4.9.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -144,6 +144,87 @@ function requireRegisteredUser(req, res, next) {
 function requireAdmin(req, res, next) {
     if (req.user?.uid !== ADMIN_UID && req.user?.admin !== true) return res.status(403).json({ error:{ message:'Administrator access required.' } });
     next();
+}
+
+async function deleteDocumentTree(documentReference) {
+    const childCollections = await documentReference.listCollections();
+    for (const childCollection of childCollections) await deleteCollectionTree(childCollection);
+    await documentReference.delete();
+}
+
+async function deleteCollectionTree(collectionReference) {
+    while (true) {
+        const snapshot = await collectionReference.limit(200).get();
+        if (snapshot.empty) return;
+        const childCollectionGroups = await Promise.all(snapshot.docs.map(documentSnapshot => documentSnapshot.ref.listCollections()));
+        for (const childCollections of childCollectionGroups) {
+            for (const childCollection of childCollections) await deleteCollectionTree(childCollection);
+        }
+        const batch = db.batch();
+        snapshot.docs.forEach(documentSnapshot => batch.delete(documentSnapshot.ref));
+        await batch.commit();
+    }
+}
+
+async function deleteMatchingDocuments(queryReference) {
+    let deleted = 0;
+    while (true) {
+        const snapshot = await queryReference.limit(200).get();
+        if (snapshot.empty) return deleted;
+        const batch = db.batch();
+        snapshot.docs.forEach(documentSnapshot => batch.delete(documentSnapshot.ref));
+        await batch.commit();
+        deleted += snapshot.size;
+    }
+}
+
+async function removeUserFromLiveConversations(uid) {
+    const rooms = await liveConversationsCollection().where('memberUids', 'array-contains', uid).get();
+    for (const roomSnapshot of rooms.docs) {
+        const room = roomSnapshot.data() || {};
+        await deleteMatchingDocuments(roomSnapshot.ref.collection('messages').where('senderUid', '==', uid));
+        const remainingUids = (Array.isArray(room.memberUids) ? room.memberUids : []).filter(memberUid => memberUid !== uid);
+        const remainingParticipants = participantList(room.participants).filter(participant => participant.uid !== uid);
+        if (!remainingUids.length) {
+            await deleteDocumentTree(roomSnapshot.ref);
+        } else {
+            await roomSnapshot.ref.update({
+                memberUids:remainingUids,
+                participants:remainingParticipants,
+                status:'closed',
+                inviteCode:'',
+                updatedAt:FieldValue.serverTimestamp(),
+                updatedAtMs:Date.now()
+            });
+        }
+    }
+    return rooms.size;
+}
+
+async function deleteQelumiAccountData(userToken) {
+    const uid = String(userToken.uid || '');
+    const email = String(userToken.email || '').trim().toLowerCase();
+    const profileReference = qelumiProfilesCollection().doc(uid);
+    const profileSnapshot = await profileReference.get();
+    const normalizedUsername = normalizeUsername(profileSnapshot.data()?.username || '');
+
+    await deleteDocumentTree(db.doc(`artifacts/${APP_ID}/users/${uid}`));
+    await removeUserFromLiveConversations(uid);
+    await Promise.all([
+        deleteMatchingDocuments(feedbackCollection().where('uid', '==', uid)),
+        deleteMatchingDocuments(translationSearchCollection().where('uid', '==', uid)),
+        deleteMatchingDocuments(db.collection('translation_jobs').where('uid', '==', uid)),
+        deleteMatchingDocuments(db.collection('admin_metrics').doc('events').collection('items').where('uid', '==', uid))
+    ]);
+
+    const directDeletes = [
+        profileReference.delete(),
+        administratorRolesCollection().doc(administratorRoleDocumentId(uid)).delete()
+    ];
+    if (normalizedUsername) directDeletes.push(qelumiUsernamesCollection().doc(stableHash(normalizedUsername)).delete());
+    if (email) directDeletes.push(db.doc(`artifacts/${APP_ID}/public/data/registered_accounts/${stableHash(email)}`).delete());
+    await Promise.all(directDeletes);
+    await auth.deleteUser(uid);
 }
 
 async function resolveAdministratorTarget(identifier) {
@@ -605,7 +686,9 @@ app.get('/health', (_req, res) => res.json({
         viewportStickySearchBanner:true,
         searchFocusLanguageControls:true,
         overlapAwareLiveTranscription:true,
-        bilingualAntonyms:true
+        bilingualAntonyms:true,
+        publicStorePages:true,
+        authenticatedAccountDeletion:true
     },
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     renderCache:{
@@ -631,6 +714,25 @@ app.post('/api/auth/email-exists', rateLimit({ windowMs:15 * 60_000, max:20, key
         res.status(500).json({ error:{ message:'Unable to check that account.' } });
     }
 });
+
+app.delete('/api/account', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:5, key:req => `account-delete:${req.user.uid}` }),
+    async (req, res) => {
+        try {
+            if (req.body?.confirmation !== 'DELETE') {
+                return res.status(400).json({ error:{ code:'DELETION_NOT_CONFIRMED', message:'Type DELETE to confirm permanent account deletion.' } });
+            }
+            const authenticationAgeSeconds = Math.floor(Date.now() / 1000) - Number(req.user.auth_time || 0);
+            if (!Number.isFinite(authenticationAgeSeconds) || authenticationAgeSeconds < 0 || authenticationAgeSeconds > 10 * 60) {
+                return res.status(401).json({ error:{ code:'RECENT_LOGIN_REQUIRED', message:'For security, sign out and sign in again before deleting your account.' } });
+            }
+            await deleteQelumiAccountData(req.user);
+            res.json({ ok:true, deleted:true });
+        } catch (error) {
+            if (error.code === 'auth/user-not-found') return res.json({ ok:true, deleted:true });
+            res.status(error.status || 500).json({ error:{ code:error.code || 'ACCOUNT_DELETION_FAILED', message:error.message || 'The account could not be deleted.' } });
+        }
+    });
 
 app.get('/api/profile', requireUser, async (req, res) => {
     const profile = await qelumiProfilesCollection().doc(req.user.uid).get();
