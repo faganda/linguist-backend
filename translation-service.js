@@ -19,7 +19,7 @@ export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less com
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 export const ANTONYM_STATUS_VALUES = Object.freeze(['available', 'no-direct-antonym']);
 
-export const DICTIONARY_SCHEMA_VERSION = 19;
+export const DICTIONARY_SCHEMA_VERSION = 20;
 export const PREVIEW_SCHEMA_VERSION = 4;
 export const TRANSLATION_LIST_SCHEMA_VERSION = 2;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
@@ -1856,6 +1856,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     function parseStored(snapshot, context) {
         if (!snapshot?.exists) return null;
         const stored = snapshot.data();
+        if (stored.deletedAt || stored.qualityStatus === 'superseded') return null;
         if (stored.fullJSON == null && stored.translation == null) return null;
         try {
             const raw = typeof stored.fullJSON === 'string' ? JSON.parse(stored.fullJSON) : stored.translation;
@@ -1888,7 +1889,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             schemaVersion:envelopeSchemaVersion,
             updatedAt:Number(metadata.updatedAt || Date.now()),
             expiresAt:Number(metadata.expiresAt || 0),
-            staleUntil:Number(metadata.staleUntil || 0)
+            staleUntil:Number(metadata.staleUntil || 0),
+            qualityStatus:metadata.qualityStatus || 'generated',
+            verificationStatus:metadata.verificationStatus || 'ai_generated',
+            verifiedAt:Number(metadata.verifiedAt || 0)
         }, cacheTtlForResult(result));
         const preview = previewFromCore(result, context);
         if (envelopeSchemaVersion >= DICTIONARY_SCHEMA_VERSION
@@ -1908,7 +1912,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             updatedAt:cached.updatedAt,
             expiresAt:cached.stored?.expiresAt,
             staleUntil:cached.stored?.staleUntil,
-            previewExpiresAt:cached.stored?.previewExpiresAt
+            previewExpiresAt:cached.stored?.previewExpiresAt,
+            qualityStatus:cached.stored?.qualityStatus,
+            verificationStatus:cached.stored?.verificationStatus,
+            verifiedAt:timestampMillis(cached.stored?.verifiedAt)
         });
     }
 
@@ -1949,22 +1956,30 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function saveCachedResult(context, result, metadata = {}) {
         const ref = dictionaryRef(context);
+        const previousSnapshot = await readDictionary(ref, 'Dictionary merge lookup');
+        const previousEnvelope = previousSnapshot?.exists ? previousSnapshot.data() : {};
         let merged = result;
         if (metadata.preserveExamples !== false) {
-            const previousSnapshot = await readDictionary(ref, 'Dictionary merge lookup');
             const previous = parseStored(previousSnapshot, context)?.result;
             merged = mergeContextExamples(clone(result), previous);
         }
         const now = Date.now();
         const contextsComplete = contextsAreComplete(merged, context);
         const accepted = merged?.sourceLanguageValidation?.existsInRequestedLanguage === true && merged.wordExists === true;
+        const protectedQualityStatus = ['verified', 'reported'].includes(previousEnvelope.qualityStatus)
+            ? previousEnvelope.qualityStatus : '';
+        const qualityStatus = protectedQualityStatus || (accepted ? (contextsComplete ? 'complete' : 'generated') : 'generated');
+        const verificationStatus = previousEnvelope.verificationStatus === 'qelumi_verified'
+            ? 'qelumi_verified' : 'ai_generated';
         const preview = previewFromCore(merged, context);
         cacheCoreEnvelope(context, merged, {
             schemaVersion:DICTIONARY_SCHEMA_VERSION,
             updatedAt:now,
             expiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs),
             staleUntil:now + (accepted ? staleTtlMs : mismatchTtlMs),
-            previewExpiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs)
+            previewExpiresAt:now + (accepted ? freshTtlMs : mismatchTtlMs),
+            qualityStatus, verificationStatus,
+            verifiedAt:timestampMillis(previousEnvelope.verifiedAt)
         });
         await writeDictionary(ref, {
             queryLower:normalizeDictionaryQuery(context.query), originalQuery:context.query,
@@ -1973,7 +1988,11 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             coreComplete:coreQualityIssues(merged, context).length === 0,
             contextsComplete, complete:contextsComplete,
             completenessScore:contextsComplete ? 100 : accepted ? 70 : 100,
-            status:accepted ? (contextsComplete ? 'verified' : 'core_ready') : 'validated_negative',
+            status:accepted ? (contextsComplete ? 'complete' : 'core_ready') : 'validated_negative',
+            qualityStatus,
+            verificationStatus,
+            qualityUpdatedAt:now,
+            generatedAt:previousEnvelope.generatedAt || now,
             cacheKind:accepted ? 'translation' : 'language_validation',
             model:metadata.model || '', fallbackModel:metadata.fallbackModel || '',
             fallbackUsed:metadata.fallbackUsed === true, fallbackReason:metadata.fallbackReason || '',
@@ -2140,6 +2159,9 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                         previewSchemaVersion:PREVIEW_SCHEMA_VERSION,
                         cacheLookupMs,
                         latencyMs:cacheLookupMs,
+                        qualityStatus:cachedCore.stored?.qualityStatus || (age > freshTtlMs ? 'stale' : 'generated'),
+                        verificationStatus:cachedCore.stored?.verificationStatus || 'ai_generated',
+                        updatedAt:cachedCore.updatedAt || 0,
                         fallbackUsed:false,
                         modelCalls:[]
                     }
@@ -2569,7 +2591,10 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             stored:{
                 schemaVersion:l1Cached.schemaVersion,
                 expiresAt:l1Cached.expiresAt,
-                staleUntil:l1Cached.staleUntil
+                staleUntil:l1Cached.staleUntil,
+                qualityStatus:l1Cached.qualityStatus,
+                verificationStatus:l1Cached.verificationStatus,
+                verifiedAt:l1Cached.verifiedAt
             },
             updatedAt:l1Cached.updatedAt
         } : null;
@@ -2604,6 +2629,13 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             && cached?.result?.wordExists === true;
         const cacheUsable = cached?.result && cacheBlockingIssues.length === 0
             && (accepted || negativeExpiry > Date.now());
+        const cacheQualityMeta = {
+            qualityStatus:age > freshTtlMs && cached?.stored?.qualityStatus !== 'verified'
+                ? 'stale' : (cached?.stored?.qualityStatus || 'generated'),
+            verificationStatus:cached?.stored?.verificationStatus || 'ai_generated',
+            updatedAt:cached?.updatedAt || 0,
+            verifiedAt:timestampMillis(cached?.stored?.verifiedAt)
+        };
 
         if (!forceRefresh && cacheUsable && age <= freshTtlMs && !needsSchemaRefresh) {
             if (touch) {
@@ -2614,7 +2646,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                     fromLang:context.fromLang, toLang:context.toLang
                 }).catch(() => {});
             }
-            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:cacheOrigin === 'render_l1' ? 'l1' : 'fresh', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:cacheOrigin === 'render_l1' ? 'l1' : 'fresh', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:false, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[], ...cacheQualityMeta } };
         }
 
         if (!forceRefresh && cacheUsable && age <= staleTtlMs
@@ -2632,7 +2664,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                     fromLang:context.fromLang, toLang:context.toLang
                 }).catch(() => {});
             }
-            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:needsSchemaRefresh ? 'schema_upgrade' : cacheOrigin === 'render_l1' ? 'l1_stale' : 'stale', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:true, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[] } };
+            return { result:cached.result, meta:{ source:'global_dictionary', cacheStatus:needsSchemaRefresh ? 'schema_upgrade' : cacheOrigin === 'render_l1' ? 'l1_stale' : 'stale', schemaVersion:cachedSchemaVersion, contextsReady:contextsAreComplete(cached.result, context), staleRefreshStarted:true, cacheLookupMs, latencyMs:cacheLookupMs, fallbackUsed:false, modelCalls:[], ...cacheQualityMeta } };
         }
 
         const flightKey = dictionaryIdentity(context.query, context.fromLang, context.toLang);
@@ -2640,6 +2672,11 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         const generated = await singleFlight(coreFlights, flightKey, () => generateCore(context, uid, cached?.result, translationListSeed));
         generated.meta.cacheLookupMs = cacheLookupMs;
         generated.meta.latencyMs = Math.round(performance.now() - started);
+        generated.meta.qualityStatus = cached?.stored?.qualityStatus === 'verified' ? 'verified'
+            : contextsAreComplete(generated.result, context) ? 'complete' : 'generated';
+        generated.meta.verificationStatus = cached?.stored?.verificationStatus === 'qelumi_verified'
+            ? 'qelumi_verified' : 'ai_generated';
+        generated.meta.updatedAt = Date.now();
         return generated;
     }
 

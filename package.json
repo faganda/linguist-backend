@@ -1,6 +1,6 @@
 {
   "name": "qelumi-server",
-  "version": "4.9.0",
+  "version": "5.0.0",
   "description": "Secure Qelumi translation, learning, feedback and administration backend",
   "main": "server.js",
   "type": "module",
@@ -11,6 +11,8 @@
     "start": "node server.js",
     "test": "node --test",
     "prewarm": "node scripts/nightly-prewarm.js",
+    "benchmark:validate": "node benchmark/run-production.mjs",
+    "benchmark:production": "node benchmark/run-production.mjs --execute --details",
     "mobile:sync": "npx cap sync",
     "mobile:add:android": "npx cap add android",
     "mobile:add:ios": "npx cap add ios",
@@ -33,7 +35,10 @@
     "@capacitor/local-notifications": "^8.2.1",
     "@capacitor/push-notifications": "^8.1.2",
     "@capacitor/share": "^8.0.1",
-    "@capacitor-firebase/authentication": "^8.3.0"
+    "@capacitor-firebase/authentication": "^8.3.0",
+    "@capacitor-firebase/analytics": "^8.3.0",
+    "@capacitor-firebase/crashlytics": "^8.3.0",
+    "@revenuecat/purchases-capacitor": "^13.3.0"
   },
   "overrides": {
     "uuid": "11.1.1"

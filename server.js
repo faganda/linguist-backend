@@ -9,7 +9,8 @@ import {
     LANGUAGES, PRIMARY_MODEL, PRIMARY_THINKING, FALLBACK_MODEL, FALLBACK_THINKING,
     DICTIONARY_SCHEMA_VERSION, PREVIEW_SCHEMA_VERSION, TRANSLATION_LIST_SCHEMA_VERSION,
     createTranslationService, buildGeminiCompatibilityRequests,
-    geminiCompatibilityKey, isGeminiInvalidArgument, parseGeminiJSON
+    geminiCompatibilityKey, isGeminiInvalidArgument, parseGeminiJSON,
+    dictionaryDocumentId, normalizeTranslationResult, coreQualityIssues
 } from './translation-service.js';
 import {
     buildLearningRequest, summarizePerformanceEvents
@@ -17,7 +18,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '4.9.0';
+const BACKEND_VERSION = '5.0.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -28,6 +29,15 @@ const feedbackCategories = new Set(['suggestion', 'glitch', 'translation', 'othe
 const feedbackStatuses = new Set(['new', 'read', 'closed']);
 const translationSources = new Set(['generated', 'dictionary_repair', 'global_dictionary', 'personal_history', 'image_analysis', 'language_validation']);
 const translationOutcomes = new Set(['success', 'definitions_only', 'language_mismatch', 'not_found', 'error']);
+const dictionaryQualityStatuses = new Set(['generated', 'complete', 'verified', 'reported', 'stale', 'superseded']);
+const productEventNames = new Set([
+    'session_started', 'screen_view', 'onboarding_step', 'onboarding_completed',
+    'registration_prompt_shown', 'registration_prompt_accepted',
+    'translation_result_viewed', 'translation_shared', 'word_remembered',
+    'daily_plan_opened', 'daily_plan_activity_started', 'daily_plan_summary',
+    'client_error', 'referral_shared', 'subscription_viewed', 'subscription_started',
+    'subscription_restored', 'conversation_invite_shared', 'library_item_opened'
+]);
 
 function initialiseFirebaseAdmin() {
     if (getApps().length) return getApps()[0];
@@ -50,8 +60,36 @@ const administratorAuditCollection = () => db.collection('admin_role_audit');
 const qelumiProfilesCollection = () => db.collection('qelumi_profiles');
 const qelumiUsernamesCollection = () => db.collection('qelumi_usernames');
 const liveConversationsCollection = () => db.collection('live_conversations');
+const productEventsCollection = () => db.collection('admin_metrics').doc('product_events').collection('items');
+const billingEntitlementsCollection = () => db.collection('billing_entitlements');
+const billingUsageCollection = () => db.collection('billing_usage');
+const referralCodesCollection = () => db.collection('referral_codes');
+const referralClaimsCollection = () => db.collection('referral_claims');
 const administratorRoleDocumentId = uid => crypto.createHash('sha256').update(String(uid || '')).digest('hex');
 const stableHash = value => crypto.createHash('sha256').update(String(value || '')).digest('hex');
+const publicReferralCode = uid => crypto.createHash('sha256').update(`qelumi-referral|${uid}`).digest('base64url').slice(0, 10).toUpperCase();
+const currentBillingMonth = () => new Date().toISOString().slice(0, 7);
+const dictionaryReference = id => db.doc(`artifacts/${APP_ID}/public/data/global_dictionary/${id}`);
+const dictionaryContext = data => ({
+    query:String(data?.originalQuery || data?.queryLower || ''),
+    fromLang:String(data?.fromLang || ''), toLang:String(data?.toLang || ''),
+    definitionsOnly:String(data?.fromLang || '') === String(data?.toLang || '')
+});
+const productAnalyticsKeys = new Set([
+    'screen', 'source', 'outcome', 'activity', 'plan', 'platform', 'isGuest',
+    'fromLang', 'toLang', 'cacheStatus', 'qualityStatus', 'step', 'count',
+    'durationMs', 'latencyMs', 'errorCode', 'permission', 'method', 'version'
+]);
+function cleanProductMetadata(value = {}) {
+    const safe = {};
+    for (const [key, raw] of Object.entries(value || {})) {
+        if (!productAnalyticsKeys.has(key)) continue;
+        if (typeof raw === 'boolean') safe[key] = raw;
+        else if (typeof raw === 'number' && Number.isFinite(raw)) safe[key] = Math.max(-1_000_000_000, Math.min(1_000_000_000, raw));
+        else if (typeof raw === 'string') safe[key] = raw.replace(/[\r\n]/g, ' ').slice(0, 80);
+    }
+    return safe;
+}
 const normalizeUsername = value => String(value || '').normalize('NFKC').trim().toLocaleLowerCase('en');
 const reservedUsernames = new Set(['admin','administrator','qelumi','support','feedback','system','official','moderator']);
 const privateInviteAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -209,17 +247,23 @@ async function deleteQelumiAccountData(userToken) {
     const normalizedUsername = normalizeUsername(profileSnapshot.data()?.username || '');
 
     await deleteDocumentTree(db.doc(`artifacts/${APP_ID}/users/${uid}`));
+    await deleteDocumentTree(billingUsageCollection().doc(uid));
     await removeUserFromLiveConversations(uid);
     await Promise.all([
         deleteMatchingDocuments(feedbackCollection().where('uid', '==', uid)),
         deleteMatchingDocuments(translationSearchCollection().where('uid', '==', uid)),
         deleteMatchingDocuments(db.collection('translation_jobs').where('uid', '==', uid)),
-        deleteMatchingDocuments(db.collection('admin_metrics').doc('events').collection('items').where('uid', '==', uid))
+        deleteMatchingDocuments(db.collection('admin_metrics').doc('events').collection('items').where('uid', '==', uid)),
+        deleteMatchingDocuments(productEventsCollection().where('userHash', '==', stableHash(uid))),
+        deleteMatchingDocuments(referralCodesCollection().where('uid', '==', uid)),
+        deleteMatchingDocuments(referralClaimsCollection().where('inviterUid', '==', uid))
     ]);
 
     const directDeletes = [
         profileReference.delete(),
-        administratorRolesCollection().doc(administratorRoleDocumentId(uid)).delete()
+        administratorRolesCollection().doc(administratorRoleDocumentId(uid)).delete(),
+        billingEntitlementsCollection().doc(uid).delete(),
+        referralClaimsCollection().doc(uid).delete()
     ];
     if (normalizedUsername) directDeletes.push(qelumiUsernamesCollection().doc(stableHash(normalizedUsername)).delete());
     if (email) directDeletes.push(db.doc(`artifacts/${APP_ID}/public/data/registered_accounts/${stableHash(email)}`).delete());
@@ -336,6 +380,51 @@ async function recordUsage(uid, operation, metadata = {}) {
         uid, operation, metadata:eventMetadata, timestamp:FieldValue.serverTimestamp()
     });
 }
+
+const allowanceLimits = {
+    free:{newTranslations:100, detailedTranslations:30, aiPracticeSessions:10},
+    plus:{newTranslations:2_000, detailedTranslations:500, aiPracticeSessions:200}
+};
+
+async function billingState(uid) {
+    const [entitlementSnapshot, usageSnapshot] = await Promise.all([
+        billingEntitlementsCollection().doc(uid).get(),
+        billingUsageCollection().doc(uid).collection('months').doc(currentBillingMonth()).get()
+    ]);
+    const entitlement = entitlementSnapshot.exists ? entitlementSnapshot.data() : {};
+    const expiresAt = timestampMillis(entitlement.expiresAt || entitlement.expirationAtMs);
+    const active = entitlement.active === true && (!expiresAt || expiresAt > Date.now());
+    return {
+        entitlement:{...entitlement, active, expiresAt},
+        usage:usageSnapshot.exists ? usageSnapshot.data() : {},
+        limits:active ? allowanceLimits.plus : allowanceLimits.free
+    };
+}
+
+async function recordBillingUsage(uid, category, amount = 1) {
+    if (!allowanceLimits.free[category]) return;
+    await billingUsageCollection().doc(uid).collection('months').doc(currentBillingMonth()).set({
+        month:currentBillingMonth(),
+        [category]:FieldValue.increment(Math.max(1, Number(amount) || 1)),
+        updatedAt:FieldValue.serverTimestamp()
+    }, {merge:true});
+}
+
+const enforceAllowance = category => async (req, res, next) => {
+    if (process.env.BILLING_ENFORCEMENT_ENABLED !== 'true') return next();
+    try {
+        const status = await billingState(req.user.uid);
+        const bonus = Number(status.entitlement?.bonusCredits || 0);
+        const used = Number(status.usage?.[category] || 0);
+        if (used >= Number(status.limits[category] || 0) + bonus) {
+            return res.status(402).json({error:{
+                code:'MONTHLY_AI_ALLOWANCE_REACHED',
+                message:'Your monthly AI allowance is used. Cached dictionary translations remain available, or upgrade to Qelumi Plus for a higher allowance.'
+            }});
+        }
+        next();
+    } catch (error) { next(error); }
+};
 
 function measuredGeminiUsage(data, startedAt, model, thinkingLevel) {
     const usage = data?.usageMetadata || {};
@@ -688,8 +777,20 @@ app.get('/health', (_req, res) => res.json({
         overlapAwareLiveTranscription:true,
         bilingualAntonyms:true,
         publicStorePages:true,
-        authenticatedAccountDeletion:true
+        authenticatedAccountDeletion:true,
+        simplifiedNavigation:true,
+        unifiedLibrary:true,
+        personalisedOnboarding:true,
+        qelumiPath:true,
+        purposeCollections:true,
+        dictionaryQualityWorkflow:true,
+        publicVerifiedDictionary:true,
+        privacySafeProductAnalytics:true,
+        revenueCatEntitlements:true,
+        referrals:true
     },
+    reliabilityTargets:{cachedP95Ms:500, translationListP95Ms:5000, detailsP95Ms:15000, requestFailureRateMax:0.01, benchmarkCases:600},
+    monetization:{enforcementEnabled:process.env.BILLING_ENFORCEMENT_ENABLED === 'true', provider:'RevenueCat'},
     models:{ primary:PRIMARY_MODEL, primaryThinking:PRIMARY_THINKING, fallback:FALLBACK_MODEL, fallbackThinking:FALLBACK_THINKING },
     renderCache:{
         enabled:true,
@@ -705,6 +806,43 @@ app.get('/health', (_req, res) => res.json({
     )
 }));
 
+function publicDictionaryPayload(snapshot) {
+    if (!snapshot?.exists) return null;
+    const entry = snapshot.data();
+    if (entry.deletedAt || entry.qualityStatus !== 'verified' || entry.verificationStatus !== 'qelumi_verified') return null;
+    try {
+        const result = typeof entry.fullJSON === 'string' ? JSON.parse(entry.fullJSON) : entry.translation;
+        return {
+            id:snapshot.id,
+            query:entry.originalQuery,
+            fromLang:entry.fromLang,
+            toLang:entry.toLang,
+            result,
+            qualityStatus:'verified',
+            verificationStatus:'qelumi_verified',
+            verifiedAt:timestampMillis(entry.verifiedAt),
+            updatedAt:timestampMillis(entry.updatedAt)
+        };
+    } catch (_) { return null; }
+}
+
+app.get('/api/public/dictionary/:id', rateLimit({windowMs:60_000, max:120}), async (req, res) => {
+    if (!/^[a-f0-9]{64}$/i.test(req.params.id)) return res.status(400).json({error:{message:'Invalid dictionary entry identifier.'}});
+    const payload = publicDictionaryPayload(await dictionaryReference(req.params.id).get());
+    if (!payload) return res.status(404).json({error:{message:'That verified dictionary entry is not public.'}});
+    res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=3600').json(payload);
+});
+
+app.get('/api/public/dictionary', rateLimit({windowMs:60_000, max:120}), async (req, res) => {
+    try {
+        const context = translationContext(req.query);
+        const id = dictionaryDocumentId(context.query, context.fromLang, context.toLang);
+        const payload = publicDictionaryPayload(await dictionaryReference(id).get());
+        if (!payload) return res.status(404).json({error:{message:'That verified dictionary entry is not public.'}});
+        res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=3600').json(payload);
+    } catch (error) { res.status(error.status || 400).json({error:{message:error.message}}); }
+});
+
 app.post('/api/auth/email-exists', rateLimit({ windowMs:15 * 60_000, max:20, key:req => `email:${req.ip}` }), async (req, res) => {
     try {
         await auth.getUserByEmail(String(req.body?.email || '').trim().toLowerCase());
@@ -714,6 +852,84 @@ app.post('/api/auth/email-exists', rateLimit({ windowMs:15 * 60_000, max:20, key
         res.status(500).json({ error:{ message:'Unable to check that account.' } });
     }
 });
+
+app.post('/api/product-events', requireUser,
+    rateLimit({windowMs:60 * 60_000, max:500, key:req => `product-events:${req.user.uid}`}), async (req, res) => {
+        const event = String(req.body?.event || '').trim();
+        if (!productEventNames.has(event)) return res.status(400).json({error:{message:'Unsupported product event.'}});
+        await productEventsCollection().add({
+            event,
+            userHash:stableHash(req.user.uid),
+            accountKind:req.user.firebase?.sign_in_provider === 'anonymous' ? 'guest' : 'registered',
+            metadata:cleanProductMetadata(req.body?.metadata),
+            timestamp:Date.now(),
+            createdAt:FieldValue.serverTimestamp()
+        });
+        res.status(201).json({ok:true});
+    });
+
+app.get('/api/billing/status', requireUser, async (req, res) => {
+    const status = await billingState(req.user.uid);
+    res.json({
+        enforcementEnabled:process.env.BILLING_ENFORCEMENT_ENABLED === 'true',
+        entitlement:status.entitlement,
+        usage:status.usage,
+        limits:status.limits,
+        month:currentBillingMonth()
+    });
+});
+
+app.post('/api/webhooks/revenuecat', async (req, res) => {
+    const expected = String(process.env.REVENUECAT_WEBHOOK_SECRET || '');
+    const supplied = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+    if (!expected || supplied.length !== expected.length
+        || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) {
+        return res.status(401).json({error:{message:'Invalid RevenueCat webhook authorization.'}});
+    }
+    const event = req.body?.event || {};
+    const uid = String(event.app_user_id || '').trim();
+    if (!uid || uid.startsWith('$RCAnonymousID:')) return res.json({ok:true, ignored:true});
+    const expirationAtMs = Number(event.expiration_at_ms || 0);
+    const expired = ['EXPIRATION'].includes(String(event.type || '').toUpperCase()) || (expirationAtMs && expirationAtMs <= Date.now());
+    const willRenew = !['CANCELLATION', 'EXPIRATION', 'BILLING_ISSUE'].includes(String(event.type || '').toUpperCase());
+    await billingEntitlementsCollection().doc(uid).set({
+        active:!expired,
+        productId:String(event.product_id || ''),
+        store:String(event.store || ''),
+        eventType:String(event.type || ''),
+        expiresAt:expirationAtMs,
+        willRenew,
+        entitlementIds:Array.isArray(event.entitlement_ids) ? event.entitlement_ids.slice(0, 20) : [],
+        updatedAt:FieldValue.serverTimestamp()
+    }, {merge:true});
+    res.json({ok:true});
+});
+
+app.get('/api/referrals/me', requireUser, requireRegisteredUser, async (req, res) => {
+    const code = publicReferralCode(req.user.uid);
+    await referralCodesCollection().doc(code).set({uid:req.user.uid, code, createdAt:FieldValue.serverTimestamp()}, {merge:true});
+    const rewards = await referralClaimsCollection().where('inviterUid', '==', req.user.uid).get();
+    res.json({code, rewards:rewards.size});
+});
+
+app.post('/api/referrals/claim', requireUser, requireRegisteredUser,
+    rateLimit({windowMs:24 * 60 * 60_000, max:5, key:req => `referral-claim:${req.user.uid}`}), async (req, res) => {
+        const code = String(req.body?.code || '').trim().toUpperCase().slice(0, 20);
+        const codeSnapshot = await referralCodesCollection().doc(code).get();
+        if (!codeSnapshot.exists) return res.status(404).json({error:{message:'That referral code is invalid.'}});
+        const inviterUid = String(codeSnapshot.data()?.uid || '');
+        if (!inviterUid || inviterUid === req.user.uid) return res.status(400).json({error:{message:'You cannot use your own referral code.'}});
+        const claimReference = referralClaimsCollection().doc(req.user.uid);
+        let created = false;
+        await db.runTransaction(async transaction => {
+            if ((await transaction.get(claimReference)).exists) return;
+            transaction.create(claimReference, {inviteeUid:req.user.uid, inviterUid, code, createdAt:FieldValue.serverTimestamp()});
+            transaction.set(billingEntitlementsCollection().doc(req.user.uid), {bonusCredits:FieldValue.increment(10)}, {merge:true});
+            transaction.set(billingEntitlementsCollection().doc(inviterUid), {bonusCredits:FieldValue.increment(10)}, {merge:true});
+            created = true;
+        });
+        res.json({ok:true, created, bonusCredits:created ? 10 : 0});
+    });
 
 app.delete('/api/account', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:5, key:req => `account-delete:${req.user.uid}` }),
@@ -964,6 +1180,7 @@ app.post('/api/translate', requireUser, rateLimit({ windowMs:60 * 60_000, max:12
         const context = translationContext(req.body);
         const forceRefresh = req.body?.forceRefresh === true && (req.user.uid === ADMIN_UID || req.user.admin === true);
         const response = await translationService.getCore(context, req.user.uid, { forceRefresh });
+        if (response.meta?.source !== 'global_dictionary' && response.meta?.source !== 'render_l1') recordBillingUsage(req.user.uid, 'newTranslations').catch(() => {});
         res.json(response);
     } catch (error) {
         res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_FAILED' } });
@@ -973,7 +1190,9 @@ app.post('/api/translate', requireUser, rateLimit({ windowMs:60 * 60_000, max:12
 app.post('/api/translate/list', requireUser, rateLimit({ windowMs:60 * 60_000, max:180, key:req => `translation-list:${req.user.uid}` }), async (req, res) => {
     try {
         const context = translationContext(req.body);
-        res.json(await translationService.getTranslationList(context, req.user.uid));
+        const response = await translationService.getTranslationList(context, req.user.uid);
+        if (response.meta?.source !== 'global_dictionary' && response.meta?.source !== 'preview_cache') recordBillingUsage(req.user.uid, 'newTranslations').catch(() => {});
+        res.json(response);
     } catch (error) {
         res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_LIST_FAILED' } });
     }
@@ -984,7 +1203,9 @@ app.post('/api/translate/details', requireUser, rateLimit({ windowMs:60 * 60_000
         const context = translationContext(req.body);
         const forceRefresh = req.body?.forceRefresh === true
             && (req.user.uid === ADMIN_UID || req.user.admin === true);
-        res.json(await translationService.getCompleteDetails(context, req.user.uid, { forceRefresh }));
+        const response = await translationService.getCompleteDetails(context, req.user.uid, { forceRefresh });
+        if (Array.isArray(response.meta?.modelCalls) && response.meta.modelCalls.length) recordBillingUsage(req.user.uid, 'detailedTranslations').catch(() => {});
+        res.json(response);
     } catch (error) {
         res.status(error.status || 500).json({ error:{ message:error.message, code:error.code || 'TRANSLATION_DETAILS_FAILED' } });
     }
@@ -1027,7 +1248,9 @@ app.post('/api/game/distractors', requireUser, rateLimit({ windowMs:60 * 60_000,
 
 const learningRoute = feature => async (req, res) => {
     try {
-        res.json(await runLearningFeature(feature, req.body || {}, req.user.uid));
+        const response = await runLearningFeature(feature, req.body || {}, req.user.uid);
+        recordBillingUsage(req.user.uid, 'aiPracticeSessions').catch(() => {});
+        res.json(response);
     } catch (error) {
         res.status(error.status || 500).json({
             error:{ message:error.message, code:error.code || `LEARNING_${feature.toUpperCase()}_FAILED` }
@@ -1037,18 +1260,23 @@ const learningRoute = feature => async (req, res) => {
 
 app.post('/api/learning/context-lens', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:50, key:req => `context-lens:${req.user.uid}` }),
+    enforceAllowance('aiPracticeSessions'),
     learningRoute('context_lens'));
 app.post('/api/learning/shadowing', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:30, key:req => `shadowing:${req.user.uid}` }),
+    enforceAllowance('aiPracticeSessions'),
     learningRoute('shadowing'));
 app.post('/api/learning/conversation', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:100, key:req => `conversation:${req.user.uid}` }),
+    enforceAllowance('aiPracticeSessions'),
     learningRoute('conversation'));
 app.post('/api/learning/story', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:20, key:req => `story:${req.user.uid}` }),
+    enforceAllowance('aiPracticeSessions'),
     learningRoute('story'));
 app.post('/api/learning/writing-coach', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:40, key:req => `writing-coach:${req.user.uid}` }),
+    enforceAllowance('aiPracticeSessions'),
     learningRoute('writing_coach'));
 
 app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10, key:req => `feedback:${req.user.uid}` }), async (req, res) => {
@@ -1057,6 +1285,9 @@ app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10,
     const replyEmail = String(req.body?.replyEmail || req.body?.email || '').trim().toLowerCase();
     const attachmentName = String(req.body?.attachmentName || '').trim().slice(0, 240);
     const attachmentData = typeof req.body?.attachmentData === 'string' ? req.body.attachmentData : '';
+    const translationQuery = String(req.body?.translationQuery || '').normalize('NFKC').trim().replace(/\s+/g, ' ').slice(0, 300);
+    const translationFromLang = String(req.body?.translationFromLang || '').toUpperCase().slice(0, 5);
+    const translationToLang = String(req.body?.translationToLang || '').toUpperCase().slice(0, 5);
     if (!text || text.length > 10_000) return res.status(400).json({ error:{ message:'Feedback must contain between 1 and 10,000 characters.' } });
     if (replyEmail && !validEmail(replyEmail)) return res.status(400).json({ error:{ message:'The reply email address is invalid.' } });
     if (attachmentData.length > 700_000) return res.status(413).json({ error:{ message:'The feedback attachment is too large.' } });
@@ -1074,11 +1305,29 @@ app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10,
         notificationStatus:'pending',
         notificationAttempts:0,
         hasAttachment:!!attachmentData,
+        ...(category === 'translation' && translationQuery && LANGUAGES[translationFromLang] && LANGUAGES[translationToLang]
+            ? {translationQuery, translationFromLang, translationToLang,
+                dictionaryEntryId:dictionaryDocumentId(translationQuery, translationFromLang, translationToLang)} : {}),
         createdAt:FieldValue.serverTimestamp(),
         ...(attachmentName ? { attachmentName } : {}),
         ...(attachmentData ? { attachmentData } : {})
     };
     await feedbackRef.set(feedback);
+    if (feedback.dictionaryEntryId) {
+        const entryReference = dictionaryReference(feedback.dictionaryEntryId);
+        await db.runTransaction(async transaction => {
+            const snapshot = await transaction.get(entryReference);
+            if (!snapshot.exists) return;
+            transaction.set(entryReference, {
+                qualityStatus:'reported',
+                previousQualityStatus:snapshot.data()?.qualityStatus || 'generated',
+                reportedAt:FieldValue.serverTimestamp(),
+                reportedBy:stableHash(req.user.uid),
+                qualityUpdatedAt:Date.now()
+            }, {merge:true});
+        }).catch(() => {});
+        translationService.invalidateDocumentId(feedback.dictionaryEntryId);
+    }
     try {
         const delivery = await sendFeedbackNotification(feedbackRef.id, feedback);
         await feedbackRef.update({
@@ -1284,10 +1533,118 @@ app.get('/api/admin/performance', requireUser, requireAdmin, async (req, res) =>
     });
 });
 
+app.get('/api/admin/product', requireUser, requireAdmin, async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 5_000, 10_000);
+    const snapshot = await productEventsCollection().orderBy('timestamp', 'desc').limit(limit).get();
+    const events = snapshot.docs.map(document => document.data());
+    const sevenDaysAgo = Date.now() - 7 * 86_400_000;
+    const remembered = events.filter(event => event.event === 'word_remembered' && Number(event.timestamp || 0) >= sevenDaysAgo);
+    const funnelNames = ['session_started','translation_result_viewed','word_remembered','daily_plan_opened','daily_plan_summary','subscription_started'];
+    const funnel = Object.fromEntries(funnelNames.map(name => [name, events.filter(event => event.event === name).length]));
+    res.json({
+        generatedAt:Date.now(),
+        sampleSize:events.length,
+        northStar:{
+            name:'Weekly Remembered Words',
+            count:remembered.length,
+            learners:new Set(remembered.map(event => event.userHash)).size
+        },
+        funnel,
+        accountKinds:{
+            guest:events.filter(event => event.accountKind === 'guest').length,
+            registered:events.filter(event => event.accountKind === 'registered').length
+        },
+        recentErrors:events.filter(event => event.event === 'client_error').slice(0, 100)
+            .map(event => ({timestamp:event.timestamp, metadata:event.metadata}))
+    });
+});
+
+async function snapshotDictionaryVersion(reference, action, administratorUid) {
+    const snapshot = await reference.get();
+    if (!snapshot.exists) throw Object.assign(new Error('Dictionary entry not found.'), {status:404});
+    const versionReference = reference.collection('versions').doc();
+    await versionReference.set({
+        entryId:reference.id,
+        action,
+        administratorUid,
+        snapshot:snapshot.data(),
+        timestamp:Date.now(),
+        createdAt:FieldValue.serverTimestamp()
+    });
+    return {snapshot, versionId:versionReference.id};
+}
+
+async function validateDictionaryJSON(entry, candidate) {
+    const context = dictionaryContext(entry);
+    const raw = typeof candidate === 'string' ? JSON.parse(candidate) : candidate;
+    const normalized = normalizeTranslationResult(raw, context);
+    const issues = coreQualityIssues(normalized, context);
+    if (issues.length) throw Object.assign(new Error(`The correction is incomplete: ${issues.join(', ')}.`), {status:400});
+    return normalized;
+}
+
 app.get('/api/admin/dictionary', requireUser, requireAdmin, async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 100, 500);
     const snapshot = await db.collectionGroup('global_dictionary').limit(limit).get();
-    res.json({ entries:snapshot.docs.map(document => ({ id:document.id, path:document.ref.path, ...document.data(), fullJSON:undefined })) });
+    const includeArchived = req.query.includeArchived === 'true';
+    res.json({ entries:snapshot.docs
+        .filter(document => includeArchived || !document.data()?.deletedAt)
+        .map(document => ({ id:document.id, path:document.ref.path, ...document.data(), fullJSON:undefined })) });
+});
+
+app.get('/api/admin/dictionary/:id', requireUser, requireAdmin, async (req, res) => {
+    if (!/^[a-f0-9]{64}$/i.test(req.params.id)) return res.status(400).json({error:{message:'Invalid dictionary entry identifier.'}});
+    const reference = dictionaryReference(req.params.id);
+    const [entry, versions] = await Promise.all([
+        reference.get(), reference.collection('versions').orderBy('timestamp', 'desc').limit(50).get()
+    ]);
+    if (!entry.exists) return res.status(404).json({error:{message:'Dictionary entry not found.'}});
+    res.json({
+        entry:{id:entry.id, ...entry.data()},
+        versions:versions.docs.map(version => ({id:version.id, ...version.data(), createdAt:timestampMillis(version.data().createdAt)}))
+    });
+});
+
+app.patch('/api/admin/dictionary/:id', requireUser, requireAdmin, async (req, res) => {
+    if (!/^[a-f0-9]{64}$/i.test(req.params.id)) return res.status(400).json({error:{message:'Invalid dictionary entry identifier.'}});
+    const reference = dictionaryReference(req.params.id);
+    const action = String(req.body?.action || '').toLowerCase();
+    if (!['verify','report','stale','archive','restore','correct','restore_version'].includes(action)) {
+        return res.status(400).json({error:{message:'Unsupported dictionary action.'}});
+    }
+    try {
+        const {snapshot, versionId} = await snapshotDictionaryVersion(reference, action, req.user.uid);
+        const entry = snapshot.data();
+        let update = {qualityUpdatedAt:Date.now(), qualityUpdatedBy:req.user.uid};
+        if (action === 'verify') {
+            await validateDictionaryJSON(entry, entry.fullJSON || entry.translation);
+            update = {...update, qualityStatus:'verified', verificationStatus:'qelumi_verified', verifiedAt:FieldValue.serverTimestamp(), verifiedBy:req.user.uid, deletedAt:FieldValue.delete()};
+        } else if (action === 'report') {
+            update = {...update, previousQualityStatus:entry.qualityStatus || 'generated', qualityStatus:'reported', reportedAt:FieldValue.serverTimestamp(), reportedBy:req.user.uid};
+        } else if (action === 'stale') {
+            update = {...update, previousQualityStatus:entry.qualityStatus || 'generated', qualityStatus:'stale'};
+        } else if (action === 'archive') {
+            update = {...update, previousQualityStatus:entry.qualityStatus || 'complete', qualityStatus:'superseded', deletedAt:FieldValue.serverTimestamp(), deletedBy:req.user.uid};
+        } else if (action === 'restore') {
+            update = {...update, qualityStatus:dictionaryQualityStatuses.has(entry.previousQualityStatus) && entry.previousQualityStatus !== 'superseded' ? entry.previousQualityStatus : 'complete', deletedAt:FieldValue.delete(), deletedBy:FieldValue.delete()};
+        } else if (action === 'correct') {
+            const normalized = await validateDictionaryJSON(entry, req.body?.result);
+            update = {...update, fullJSON:JSON.stringify(normalized), schemaVersion:DICTIONARY_SCHEMA_VERSION, modelVersion:DICTIONARY_SCHEMA_VERSION, coreComplete:true, qualityStatus:'verified', verificationStatus:'qelumi_verified', verifiedAt:FieldValue.serverTimestamp(), verifiedBy:req.user.uid, deletedAt:FieldValue.delete()};
+        } else if (action === 'restore_version') {
+            const selected = await reference.collection('versions').doc(String(req.body?.versionId || '')).get();
+            if (!selected.exists) throw Object.assign(new Error('Dictionary version not found.'), {status:404});
+            const restored = selected.data()?.snapshot;
+            if (!restored) throw Object.assign(new Error('That version cannot be restored.'), {status:400});
+            update = {...restored, qualityUpdatedAt:Date.now(), qualityUpdatedBy:req.user.uid, restoredFromVersion:selected.id};
+        }
+        await reference.set(update, {merge:action !== 'restore_version'});
+        translationService.invalidateDocumentId(req.params.id);
+        await db.collection('admin_metrics').doc('dictionary_audit').collection('items').add({
+            entryId:req.params.id, action, administratorUid:req.user.uid, previousVersionId:versionId,
+            timestamp:Date.now(), createdAt:FieldValue.serverTimestamp()
+        });
+        res.json({ok:true, action, previousVersionId:versionId});
+    } catch (error) { res.status(error.status || 500).json({error:{message:error.message}}); }
 });
 
 app.post('/api/admin/cache/clear', requireUser, requireAdmin, async (_req, res) => {
@@ -1299,9 +1656,18 @@ app.delete('/api/admin/dictionary/:id', requireUser, requireAdmin, async (req, r
     if (!/^[a-f0-9]{64}$/i.test(req.params.id)) {
         return res.status(400).json({ error:{ message:'Invalid dictionary entry identifier.' } });
     }
-    await db.doc(`artifacts/${APP_ID}/public/data/global_dictionary/${req.params.id}`).delete();
-    translationService.invalidateDocumentId(req.params.id);
-    res.json({ ok:true });
+    const reference = dictionaryReference(req.params.id);
+    try {
+        const {snapshot, versionId} = await snapshotDictionaryVersion(reference, 'archive', req.user.uid);
+        await reference.set({
+            previousQualityStatus:snapshot.data()?.qualityStatus || 'complete',
+            qualityStatus:'superseded', verificationStatus:snapshot.data()?.verificationStatus || 'ai_generated',
+            deletedAt:FieldValue.serverTimestamp(), deletedBy:req.user.uid,
+            qualityUpdatedAt:Date.now(), qualityUpdatedBy:req.user.uid
+        }, {merge:true});
+        translationService.invalidateDocumentId(req.params.id);
+        res.json({ ok:true, archived:true, previousVersionId:versionId });
+    } catch (error) { res.status(error.status || 500).json({error:{message:error.message}}); }
 });
 
 app.get('/api/admin/feedback', requireUser, requireAdmin, async (req, res) => {
@@ -1309,7 +1675,8 @@ app.get('/api/admin/feedback', requireUser, requireAdmin, async (req, res) => {
     const snapshot = await feedbackCollection()
         .select('uid', 'accountEmail', 'replyEmail', 'email', 'category', 'type', 'text', 'date', 'status',
             'notificationStatus', 'notificationAttempts', 'notificationEmailId', 'notificationError',
-            'attachmentName', 'hasAttachment', 'createdAt')
+            'attachmentName', 'hasAttachment', 'translationQuery', 'translationFromLang',
+            'translationToLang', 'dictionaryEntryId', 'createdAt')
         .orderBy('date', 'desc').limit(limit).get();
     res.json({ feedback:snapshot.docs.map(document => {
         const data = document.data();
