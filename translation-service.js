@@ -19,9 +19,9 @@ export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less com
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 export const ANTONYM_STATUS_VALUES = Object.freeze(['available', 'no-direct-antonym']);
 
-export const DICTIONARY_SCHEMA_VERSION = 20;
-export const PREVIEW_SCHEMA_VERSION = 4;
-export const TRANSLATION_LIST_SCHEMA_VERSION = 2;
+export const DICTIONARY_SCHEMA_VERSION = 21;
+export const PREVIEW_SCHEMA_VERSION = 5;
+export const TRANSLATION_LIST_SCHEMA_VERSION = 3;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
 export const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
@@ -431,6 +431,32 @@ export function normalizeDictionaryQuery(value) {
     return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en');
 }
 
+export function meaningFingerprint(value) {
+    const contract = [
+        value?.label,
+        value?.partOfSpeech || value?.meaningPartOfSpeech,
+        value?.register || value?.meaningRegister,
+        value?.sourceDefinition,
+        value?.targetDefinition
+    ].map(normalizeDictionaryQuery).join('\u241f');
+    return crypto.createHash('sha256').update(contract).digest('hex').slice(0, 24);
+}
+
+function contextMatchesMeaning(contextItem, meaning) {
+    if (!contextItem || !meaning) return false;
+    const expected = meaningFingerprint(meaning);
+    if (cleanText(contextItem.meaningFingerprint)) {
+        return contextItem.meaningFingerprint === expected;
+    }
+    // Schema-20 records did not store a fingerprint. Reuse only when their full
+    // semantic contract matches; an index or label alone is not sufficient.
+    return normalizeDictionaryQuery(contextItem.meaningLabel || contextItem.contextName) === normalizeDictionaryQuery(meaning.label)
+        && normalizeDictionaryQuery(contextItem.meaningPartOfSpeech) === normalizeDictionaryQuery(meaning.partOfSpeech)
+        && normalizeDictionaryQuery(contextItem.meaningRegister) === normalizeDictionaryQuery(meaning.register)
+        && normalizeDictionaryQuery(contextItem.sourceDefinition) === normalizeDictionaryQuery(meaning.sourceDefinition)
+        && normalizeDictionaryQuery(contextItem.targetDefinition) === normalizeDictionaryQuery(meaning.targetDefinition);
+}
+
 export function dictionaryIdentity(query, fromLang, toLang) {
     return `${cleanCode(fromLang)}|${cleanCode(toLang)}|${normalizeDictionaryQuery(query)}`;
 }
@@ -441,6 +467,14 @@ export function dictionaryDocumentId(query, fromLang, toLang) {
 
 export function examplesPerContext(contextCount) {
     return contextCount === 1 ? 10 : 5;
+}
+
+function exactExpressionGuidance(context) {
+    const exact = normalizeDictionaryQuery(context.query).replace(/[’‘]/gu, "'");
+    if (cleanCode(context.fromLang) === 'EN' && exact === "it's got bells on") {
+        return `\nKNOWN EXPRESSION DISAMBIGUATION: "It's got bells on" is conventionally the elliptical final clause of British "Pull the other one—it's got bells on", used to express disbelief (roughly, "I don't believe you"). Analyse that exact idiomatic use. Do not conflate it with "with bells on" (eagerly/enthusiastically), "bells and whistles" (extra features), or a literal object wearing bells.`;
+    }
+    return '';
 }
 
 function normalizeRegister(value, fallback = 'Neutral') {
@@ -916,11 +950,7 @@ export function normalizeTranslationResult(rawResult, context) {
     ], 20);
     const previousContexts = Array.isArray(result.contexts) ? result.contexts : [];
     const contexts = meanings.map((meaning, meaningIndex) => {
-        const existing = previousContexts.find(item => Number(item?.meaningIndex) === meaningIndex)
-            || previousContexts.find(item =>
-                normalizeDictionaryQuery(item?.contextName) === normalizeDictionaryQuery(meaning.label)
-            )
-            || {};
+        const existing = previousContexts.find(item => contextMatchesMeaning(item, meaning)) || {};
         return {
             contextName:meaning.label,
             meaningIndex,
@@ -929,6 +959,7 @@ export function normalizeTranslationResult(rawResult, context) {
             meaningRegister:meaning.register,
             sourceDefinition:meaning.sourceDefinition,
             targetDefinition:meaning.targetDefinition,
+            meaningFingerprint:meaningFingerprint(meaning),
             examples:Array.isArray(existing.examples) ? existing.examples : []
         };
     });
@@ -1067,13 +1098,16 @@ export function coreQualityIssues(result, context) {
         || !MODALITY_VALUES.includes(result.learningMetadata?.modality)) {
         issues.push('invalid learning metadata');
     }
-    if (!hasText(result.learningMetadata?.sourceNote)) issues.push('missing source learning note');
-    if (!definitionsOnly && !hasText(result.learningMetadata?.targetNote)) issues.push('missing target learning note');
+    // Learning notes are enrichment metadata and are not displayed in the
+    // translation result. Empty notes must not make otherwise valid details
+    // enter an endless retry loop.
     if (!definitionsOnly && !result.mainTranslation?.some(hasText)) issues.push('missing main translation');
     if (!hasText(result.etymology?.sourceLang)) issues.push('missing source etymology');
     if (!definitionsOnly && !hasText(result.etymology?.targetLang)) issues.push('missing target etymology');
     if (!bilingualHasContent(result.definitions, definitionsOnly)) issues.push('missing definitions');
-    if (!bilingualHasContent(result.synonyms, definitionsOnly)) issues.push('missing synonyms');
+    // Some idioms, proper names and specialist entries genuinely have no
+    // responsible synonym. The bilingual container is mandatory; content is not.
+    if (!bilingualHasContent(result.synonyms, definitionsOnly, true)) issues.push('invalid synonyms section');
     if (!result.antonyms
         || !Array.isArray(result.antonyms.sourceLang)
         || !Array.isArray(result.antonyms.targetLang)
@@ -1086,9 +1120,10 @@ export function coreQualityIssues(result, context) {
         && (result.antonyms.sourceLang.some(hasText) || result.antonyms.targetLang.some(hasText))) {
         issues.push('antonym decision contradicts returned entries');
     }
-    const sourceRelated = [...(result.similarPhrases?.sourceLang || []), ...(result.collocations?.sourceLang || [])];
-    const targetRelated = [...(result.similarPhrases?.targetLang || []), ...(result.collocations?.targetLang || [])];
-    if (!sourceRelated.some(hasText) || (!definitionsOnly && !targetRelated.some(hasText))) issues.push('missing related phrases or collocations');
+    if (!bilingualHasContent(result.similarPhrases, definitionsOnly, true)
+        || !bilingualHasContent(result.collocations, definitionsOnly, true)) {
+        issues.push('invalid related-phrases section');
+    }
     if (!Array.isArray(result.meanings) || !result.meanings.length
         || result.meanings.some(meaning => !hasText(meaning.partOfSpeech)
             || !hasText(meaning.sourceDefinition) || !REGISTER_VALUES.includes(meaning.register)
@@ -1133,7 +1168,8 @@ export function coreQualityIssues(result, context) {
                 || contextItem.meaningPartOfSpeech !== meaning.partOfSpeech
                 || contextItem.meaningRegister !== meaning.register
                 || contextItem.sourceDefinition !== meaning.sourceDefinition
-                || contextItem.targetDefinition !== meaning.targetDefinition;
+                || contextItem.targetDefinition !== meaning.targetDefinition
+                || contextItem.meaningFingerprint !== meaningFingerprint(meaning);
         })) {
         issues.push('contexts do not match meanings one-to-one');
     }
@@ -1200,6 +1236,7 @@ export function contextsAreComplete(result, context) {
         && item.meaningRegister === meanings[index]?.register
         && item.sourceDefinition === meanings[index]?.sourceDefinition
         && item.targetDefinition === meanings[index]?.targetDefinition
+        && item.meaningFingerprint === meaningFingerprint(meanings[index])
         && Array.isArray(item.examples) && item.examples.length === expected
         && item.examples.every(example => exampleQualityIssues(example, context).length === 0));
 }
@@ -1220,6 +1257,7 @@ Validation fields must be internally consistent. validLanguages is supporting ev
 For an accepted entry, identify every established, practically useful grammatical class and distinct common sense. Return every class in partOfSpeech and a separate meanings item for every useful sense, each with a natural semantic label, exact English partOfSpeech, register, concise ${fromName} sourceDefinition, ${definitionsOnly ? 'an empty targetDefinition and empty translations' : `a faithful ${toName} targetDefinition and all appropriate ${toName} translations`}. Do not stop after the first sense and do not shorten the result into a teaser. Before answering, explicitly audit noun, verb, adjective, adverb, interjection, idiom, specialist-domain and proper-name uses, retaining only genuinely established ones. For a single alphabetic word, do not let a famous capitalised name suppress ordinary lowercase lexical uses or let an ordinary word suppress a genuine proper-name use. For example, English "trump" to French must cover the surname/name "Trump", the card or figurative noun "atout", the card-game verb "couper", and the verbs meaning "surpasser" or "l’emporter sur"; returning only "Trump" is incomplete.
 
 mainTranslation must be the de-duplicated union of every translation under meanings, and every mainTranslation item must appear under its correct meaning. Never repeat two meanings with the same semantic label and the same explanation. If a multiword input is a plausible literal phrase, return each distinct established or compositional meaning once; if it is instead a clear near-miss for a common expression, use suggestedCorrection rather than inventing duplicate senses. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. Use natural semantic labels such as "Physical movement", never machine keys such as verb_connect.
+${exactExpressionGuidance(context)}
 
 Return one concise pronunciationGuide containing only the pronunciation of the exact source entry in ${fromName}; never include the destination-language pronunciation, a bilingual pronunciation pair, or labels such as "(EN)" and "(FR)". Use concise English grammatical labels. Use only these registers: ${REGISTER_VALUES.join(', ')}.
 
@@ -1254,6 +1292,7 @@ Validation fields must be internally consistent. If validLanguages is nonempty, 
 For an accepted entry, provide a compact but complete core dictionary result. partOfSpeech must classify the exact whole input using concise English grammatical labels so the interface remains consistent. For a multiword entry, use a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Adjective phrase, Idiomatic expression, Clause or Sentence; never reduce "escape valve" to the bare single-word label "Noun". When established senses span word classes, list all of them, for example "Noun · Verb". Set isVerb=true whenever at least one established sense is verbal, even if the entry is also a noun or adjective.
 
 SENSE AND TRANSLATION COVERAGE IS MANDATORY. Identify every established, practically useful grammatical class and distinct common sense of the exact entry, rather than stopping after its first or most familiar use. Include at least one meanings item for every class named in partOfSpeech. For example, if partOfSpeech is "Noun · Verb", meanings must contain both a noun sense and a verb sense with their own definitions and translations. Every destination-language item in mainTranslation must appear under the appropriate meanings item, and every translation listed under a meaning must also appear in mainTranslation. mainTranslation is therefore a de-duplicated overview of all sense-level translations, not a shorter competing answer. Do not let the quick-preview wording influence completeness: the complete result must stand on its own and may contain more senses and translations than a preview.
+${exactExpressionGuidance(context)}
 
 pronunciationGuide must contain one concise pronunciation of the exact source entry in ${fromName} only. Never add a destination-language pronunciation, never return a bilingual pronunciation pair, and never append language labels such as "(EN)" or "(FR)".
 
@@ -1314,6 +1353,7 @@ export function buildDetailsRequest(context, translationList, { repairSource = n
 
 AUTHORITATIVE TRANSLATION LIST:
 ${JSON.stringify(list)}
+${exactExpressionGuidance(context)}
 
 ETYMOLOGY: both fields describe the exact source entry "${context.query}" in ${fromName}, never a destination translation. Write sourceLang entirely in ${fromName}. ${definitionsOnly ? 'Keep targetLang empty.' : `Write targetLang entirely in ${toName} as a faithful translation of the same facts.`} Give two to four concise informative sentences when reliable, and state uncertainty instead of inventing facts.
 
@@ -1346,6 +1386,11 @@ export function composeCoreFromTranslationList(translationList, details, conjuga
             ? []
             : (list.meanings || []).map(meaning => meaning.targetDefinition).filter(Boolean)
     };
+    const suppliedDefinitions = details?.definitions;
+    const definitionsComplete = Array.isArray(suppliedDefinitions?.sourceLang)
+        && suppliedDefinitions.sourceLang.some(hasText)
+        && (context.definitionsOnly || (Array.isArray(suppliedDefinitions?.targetLang)
+            && suppliedDefinitions.targetLang.some(hasText)));
     return normalizeTranslationResult({
         detectedSourceLang:list.detectedSourceLang,
         sourceLanguageValidation:list.sourceLanguageValidation,
@@ -1360,7 +1405,7 @@ export function composeCoreFromTranslationList(translationList, details, conjuga
         etymology:details?.etymology,
         isVerb:(list.meanings || []).some(meaning => /\bverb\b/iu.test(meaning.partOfSpeech || '')),
         conjugationGroups:Array.isArray(conjugationGroups) ? conjugationGroups : [],
-        definitions:details?.definitions || derivedDefinitions,
+        definitions:definitionsComplete ? suppliedDefinitions : derivedDefinitions,
         synonyms:details?.synonyms,
         antonyms:details?.antonyms,
         similarPhrases:details?.similarPhrases,
@@ -1448,13 +1493,20 @@ export function buildExamplesRequest(context, coreResult, contextItem, count, { 
     const fromName = LANGUAGES[cleanCode(context.fromLang)];
     const toName = LANGUAGES[cleanCode(context.toLang)];
     const meaning = coreResult.meanings?.[contextItem.meaningIndex] || {};
-    const system = `Generate exactly ${count} complete, natural, diverse examples for the one specified meaning of the exact Qelumi entry. Every example must illustrate this meaning and no alternate sense. Every source sentence must contain a natural inflected or exact form of the entry, and sourceSnippet must copy that exact form from original. Never end a sentence on an article, preposition, conjunction, ellipsis, dash, colon, or other unfinished fragment. Set complete=true only after checking both sentences are syntactically complete.
+    const otherMeanings = (coreResult.meanings || []).filter((_, index) => index !== contextItem.meaningIndex)
+        .map(item => ({
+            label:item.label,
+            partOfSpeech:item.partOfSpeech,
+            sourceDefinition:item.sourceDefinition,
+            targetDefinition:item.targetDefinition
+        }));
+    const system = `Generate exactly ${count} complete, natural, diverse examples for the one specified meaning of the exact Qelumi entry. Every example must illustrate this meaning and no alternate sense. Contrast the assigned definition against every excluded meaning supplied below before writing. Topic similarity is not enough: the event described by each sentence must logically instantiate the assigned sourceDefinition and targetDefinition. Never attach sport, food, computing or another domain merely because that domain appears in a different sense of the same spelling. Every source sentence must contain a natural inflected or exact form of the entry, and sourceSnippet must copy that exact form from original. Never end a sentence on an article, preposition, conjunction, ellipsis, dash, colon, or other unfinished fragment. Set complete=true only after checking both sentences are syntactically complete and semantically match the assigned meaning.
 
 ${context.definitionsOnly ? `Write original and explanation in ${fromName}. Keep translated, targetTranslatedSnippet and blankedTranslation empty.` : `Write original in ${fromName}, translate it fully into ${toName}, and explain the usage in ${fromName}. targetTranslatedSnippet must be an exact substring of translated. blankedTranslation must equal the full translation with that exact substring replaced by ___.`}
 
 Do not create distractors. Return strict JSON matching the schema.${repairIssues.length ? ` Repair these prior defects: ${repairIssues.join('; ')}.` : ''}`;
     return {
-        contents:[{ role:'user', parts:[{ text:`Entry: ${context.query}\nMeaning label: ${contextItem.meaningLabel || meaning.label}\nSource definition: ${contextItem.sourceDefinition || meaning.sourceDefinition}\nTarget definition: ${contextItem.targetDefinition || meaning.targetDefinition}\nPart of speech: ${contextItem.meaningPartOfSpeech || meaning.partOfSpeech}\nRegister: ${contextItem.meaningRegister || meaning.register}` }] }],
+        contents:[{ role:'user', parts:[{ text:`Entry: ${context.query}\nAssigned meaning label: ${contextItem.meaningLabel || meaning.label}\nAssigned source definition: ${contextItem.sourceDefinition || meaning.sourceDefinition}\nAssigned target definition: ${contextItem.targetDefinition || meaning.targetDefinition}\nAssigned part of speech: ${contextItem.meaningPartOfSpeech || meaning.partOfSpeech}\nAssigned register: ${contextItem.meaningRegister || meaning.register}\nExcluded alternate meanings (do not illustrate these): ${JSON.stringify(otherMeanings)}` }] }],
         systemInstruction:{ parts:[{ text:system }] },
         generationConfig:{ responseMimeType:'application/json', responseJsonSchema:EXAMPLES_RESPONSE_SCHEMA, maxOutputTokens:8192 }
     };
@@ -1501,14 +1553,15 @@ function timestampMillis(value) {
 
 function mergeContextExamples(newCore, previous) {
     if (!Array.isArray(previous?.contexts)) return newCore;
-    const oldByName = new Map(previous.contexts.map(item => [normalizeDictionaryQuery(item.contextName), item.examples || []]));
-    const oldByMeaningIndex = new Map(previous.contexts.map(item => [Number(item.meaningIndex), item.examples || []]));
-    newCore.contexts = (newCore.contexts || []).map((item, index) => ({
-        ...item,
-        examples:oldByMeaningIndex.get(index)
-            || oldByName.get(normalizeDictionaryQuery(item.contextName))
-            || []
-    }));
+    newCore.contexts = (newCore.contexts || []).map((item, index) => {
+        const meaning = newCore.meanings?.[index];
+        const prior = previous.contexts.find(candidate => contextMatchesMeaning(candidate, meaning));
+        return {
+            ...item,
+            meaningFingerprint:meaningFingerprint(meaning),
+            examples:Array.isArray(prior?.examples) ? prior.examples : []
+        };
+    });
     return newCore;
 }
 

@@ -1,7 +1,8 @@
 import { LANGUAGES } from './translation-service.js';
 
 export const LEARNING_FEATURES = Object.freeze([
-    'context_lens', 'shadowing', 'conversation', 'story', 'writing_coach'
+    'context_lens', 'shadowing', 'conversation', 'story', 'writing_coach',
+    'focused_practice'
 ]);
 
 const textArray = (maxItems = 10) => ({
@@ -170,12 +171,74 @@ const WRITING_SCHEMA = Object.freeze({
     required:['detectedLanguage', 'corrected', 'alternatives', 'changes', 'overallExplanation']
 });
 
+const fiveItems = item => ({
+    type:'array', minItems:5, maxItems:5, items:item
+});
+
+const sentencePracticeItem = Object.freeze({
+    type:'object', additionalProperties:false,
+    properties:{
+        sourceSentence:{ type:'string' },
+        targetSentence:{ type:'string' }
+    },
+    required:['sourceSentence', 'targetSentence']
+});
+
+const FOCUSED_PRACTICE_SCHEMA = Object.freeze({
+    type:'object', additionalProperties:false,
+    properties:{
+        sentenceBuilder:fiveItems(sentencePracticeItem),
+        translationRace:fiveItems({
+            type:'object', additionalProperties:false,
+            properties:{
+                sourceSentence:{ type:'string' }, targetSentence:{ type:'string' },
+                acceptedAnswers:textArray(5)
+            },
+            required:['sourceSentence', 'targetSentence', 'acceptedAnswers']
+        }),
+        contextDetective:fiveItems({
+            type:'object', additionalProperties:false,
+            properties:{
+                sourceSentence:{ type:'string' }, targetSentence:{ type:'string' },
+                meaningLabel:{ type:'string' }, sourceDefinition:{ type:'string' },
+                targetDefinition:{ type:'string' }, choices:textArray(4)
+            },
+            required:['sourceSentence', 'targetSentence', 'meaningLabel', 'sourceDefinition', 'targetDefinition', 'choices']
+        }),
+        wordFamilies:fiveItems({
+            type:'object', additionalProperties:false,
+            properties:{
+                word:{ type:'string' }, translation:{ type:'string' },
+                partOfSpeech:{ type:'string' }, clue:{ type:'string' },
+                choices:textArray(4)
+            },
+            required:['word', 'translation', 'partOfSpeech', 'clue', 'choices']
+        }),
+        clozeQuiz:fiveItems({
+            type:'object', additionalProperties:false,
+            properties:{
+                sourceSentence:{ type:'string' }, targetSentence:{ type:'string' },
+                clozeSentence:{ type:'string' }, answer:{ type:'string' }
+            },
+            required:['sourceSentence', 'targetSentence', 'clozeSentence', 'answer']
+        }),
+        listeningChallenge:fiveItems(sentencePracticeItem),
+        pronunciationCoach:fiveItems(sentencePracticeItem),
+        shadowingStudio:fiveItems(sentencePracticeItem)
+    },
+    required:[
+        'sentenceBuilder', 'translationRace', 'contextDetective', 'wordFamilies',
+        'clozeQuiz', 'listeningChallenge', 'pronunciationCoach', 'shadowingStudio'
+    ]
+});
+
 export const LEARNING_SCHEMAS = Object.freeze({
     context_lens:CONTEXT_LENS_SCHEMA,
     shadowing:SHADOWING_SCHEMA,
     conversation:CONVERSATION_SCHEMA,
     story:STORY_SCHEMA,
-    writing_coach:WRITING_SCHEMA
+    writing_coach:WRITING_SCHEMA,
+    focused_practice:FOCUSED_PRACTICE_SCHEMA
 });
 
 const cleanText = (value, maximum = 4_000) => String(value ?? '')
@@ -202,6 +265,22 @@ const cleanVocabulary = value => (Array.isArray(value) ? value : []).slice(0, 12
     translation:cleanText(item?.translation || item?.mainTranslation, 160),
     fromLang:cleanCode(item?.fromLang),
     toLang:cleanCode(item?.toLang)
+})).filter(item => item.word);
+
+const cleanFocusedMeanings = value => (Array.isArray(value) ? value : []).slice(0, 12).map(item => ({
+    label:cleanText(item?.label, 160),
+    partOfSpeech:cleanText(item?.partOfSpeech, 80),
+    register:cleanText(item?.register, 40),
+    sourceDefinition:cleanText(item?.sourceDefinition, 500),
+    targetDefinition:cleanText(item?.targetDefinition, 500),
+    translations:(Array.isArray(item?.translations) ? item.translations : [])
+        .slice(0, 12).map(entry => cleanText(entry, 160)).filter(Boolean)
+})).filter(item => item.label || item.sourceDefinition);
+
+const cleanFocusedFamily = value => (Array.isArray(value) ? value : []).slice(0, 20).map(item => ({
+    word:cleanText(item?.word, 120),
+    translation:cleanText(item?.translation, 160),
+    partOfSpeech:cleanText(item?.partOfSpeech, 80)
 })).filter(item => item.word);
 
 export function parseInlineMedia(value, allowedPrefixes) {
@@ -266,6 +345,37 @@ export function buildLearningRequest(feature, input = {}) {
             CONTEXT_LENS_SCHEMA, { parts:imagePart, maxOutputTokens:3_200 });
     }
 
+    if (feature === 'focused_practice') {
+        const source = language(input.sourceLang);
+        const target = language(input.targetLang);
+        const query = cleanText(input.query, 180);
+        const translations = (Array.isArray(input.translations) ? input.translations : [])
+            .slice(0, 20).map(item => cleanText(item, 180)).filter(Boolean);
+        const meanings = cleanFocusedMeanings(input.meanings);
+        const wordFamily = cleanFocusedFamily(input.wordFamily);
+        if (!query || !translations.length || !meanings.length) {
+            throw Object.assign(new Error('A complete translated entry is required for focused practice.'), { status:400 });
+        }
+        const system = `You are Qelumi's focused-practice author. Create eight independent five-round exercises about the exact source entry "${query}". Every exercise array must contain exactly five usable items.
+
+All sourceSentence values across all seven sentence-based exercise arrays must be different from one another, not merely punctuation variants. Use natural ${source.name} sentences and faithful ${target.name} translations. Every sentence must illustrate one of the supplied meanings accurately and contain the exact entry or a natural inflected form. Never borrow a sentence from an unrelated sense, topic or sport merely because it contains a similar word. Keep examples appropriate for general learners.
+
+Exercise contracts:
+- sentenceBuilder: five sentences suitable for rearranging word-by-word.
+- translationRace: five source sentences, faithful target sentences, and acceptedAnswers containing the full target sentence plus up to four genuinely equivalent answers.
+- contextDetective: five sentences, the exact supplied meaning label and definitions they illustrate, and 2-4 plausible meaning-label choices including the correct label.
+- wordFamilies: five genuine family words or morphologically related forms. If the supplied family is small, include responsible inflected or derived forms; never invent a word. choices contains 2-4 source-language words including the answer.
+- clozeQuiz: five sentences with clozeSentence equal to sourceSentence except that the exact/inflected occurrence is replaced once by ___. answer is the removed text.
+- listeningChallenge: five new sentences for source-language audio and target-language comprehension.
+- pronunciationCoach: five new, speakable source sentences of varied rhythm and length.
+- shadowingStudio: five new, natural source sentences suitable for shadowing.
+
+Do not reuse any source sentence between exercise types. Do not return commentary. Return strict JSON only.`;
+        return request(system,
+            `Source: ${source.name} (${source.code})\nTarget: ${target.name} (${target.code})\nExact entry: ${query}\nTranslations: ${translations.join(' · ')}\nMeanings:\n${JSON.stringify(meanings)}\nKnown word family:\n${JSON.stringify(wordFamily)}`,
+            FOCUSED_PRACTICE_SCHEMA, { maxOutputTokens:12_000 });
+    }
+
     if (feature === 'shadowing') {
         const source = language(input.language);
         const expectedText = cleanText(input.expectedText, 800);
@@ -316,6 +426,63 @@ export function buildLearningRequest(feature, input = {}) {
     if (!text) throw Object.assign(new Error('Enter a sentence or paragraph to review.'), { status:400 });
     const system = `You are Qelumi Writing & Tone Coach for ${writing.name}. Correct grammar, spelling, punctuation and unnatural phrasing while preserving meaning. Supply natural, formal, neutral and informal versions; where a register would be inappropriate, still provide the closest safe equivalent and explain it. Each change must teach a concrete rule or usage point. Write all explanations in ${writing.name}. Return strict JSON only.`;
     return request(system, `Text to review:\n${text}`, WRITING_SCHEMA, { maxOutputTokens:4_500 });
+}
+
+const focusedPracticeGroups = Object.freeze([
+    'sentenceBuilder', 'translationRace', 'contextDetective', 'wordFamilies',
+    'clozeQuiz', 'listeningChallenge', 'pronunciationCoach', 'shadowingStudio'
+]);
+
+export function focusedPracticeQualityIssues(result) {
+    const issues = [];
+    if (!result || typeof result !== 'object') return ['empty focused-practice result'];
+    for (const group of focusedPracticeGroups) {
+        if (!Array.isArray(result[group]) || result[group].length !== 5) {
+            issues.push(`${group} must contain exactly five items`);
+        }
+    }
+    const sentenceGroups = focusedPracticeGroups.filter(group => group !== 'wordFamilies');
+    const seenSentences = new Map();
+    for (const group of sentenceGroups) {
+        for (const [index, item] of (result[group] || []).entries()) {
+            const sourceSentence = cleanText(item?.sourceSentence, 1_000);
+            const targetSentence = cleanText(item?.targetSentence, 1_000);
+            if (!sourceSentence || !targetSentence) {
+                issues.push(`${group} item ${index + 1} is missing a complete bilingual example`);
+                continue;
+            }
+            const key = sourceSentence.toLocaleLowerCase('en').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+            if (seenSentences.has(key)) {
+                issues.push(`${group} item ${index + 1} repeats ${seenSentences.get(key)}`);
+            } else {
+                seenSentences.set(key, `${group} item ${index + 1}`);
+            }
+        }
+    }
+    for (const [index, item] of (result.translationRace || []).entries()) {
+        if (!Array.isArray(item?.acceptedAnswers) || !item.acceptedAnswers.some(answer => cleanText(answer))) {
+            issues.push(`translationRace item ${index + 1} has no accepted answer`);
+        }
+    }
+    for (const [index, item] of (result.contextDetective || []).entries()) {
+        if (!cleanText(item?.meaningLabel) || !cleanText(item?.sourceDefinition)
+            || !Array.isArray(item?.choices)
+            || !item.choices.some(choice => cleanText(choice).toLocaleLowerCase('en') === cleanText(item.meaningLabel).toLocaleLowerCase('en'))) {
+            issues.push(`contextDetective item ${index + 1} has an invalid meaning choice`);
+        }
+    }
+    for (const [index, item] of (result.wordFamilies || []).entries()) {
+        if (!cleanText(item?.word) || !Array.isArray(item?.choices)
+            || !item.choices.some(choice => cleanText(choice).toLocaleLowerCase('en') === cleanText(item.word).toLocaleLowerCase('en'))) {
+            issues.push(`wordFamilies item ${index + 1} has an invalid answer choice`);
+        }
+    }
+    for (const [index, item] of (result.clozeQuiz || []).entries()) {
+        if (!cleanText(item?.answer) || !String(item?.clozeSentence || '').includes('___')) {
+            issues.push(`clozeQuiz item ${index + 1} has an invalid blank`);
+        }
+    }
+    return [...new Set(issues)];
 }
 
 export function percentile(values, requestedPercentile) {

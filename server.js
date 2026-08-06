@@ -13,12 +13,12 @@ import {
     dictionaryDocumentId, normalizeTranslationResult, coreQualityIssues
 } from './translation-service.js';
 import {
-    buildLearningRequest, summarizePerformanceEvents
+    buildLearningRequest, focusedPracticeQualityIssues, summarizePerformanceEvents
 } from './learning-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '5.0.0';
+const BACKEND_VERSION = '5.0.4';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -65,6 +65,8 @@ const billingEntitlementsCollection = () => db.collection('billing_entitlements'
 const billingUsageCollection = () => db.collection('billing_usage');
 const referralCodesCollection = () => db.collection('referral_codes');
 const referralClaimsCollection = () => db.collection('referral_claims');
+const focusedPracticeCache = new Map();
+const focusedPracticeFlights = new Map();
 const administratorRoleDocumentId = uid => crypto.createHash('sha256').update(String(uid || '')).digest('hex');
 const stableHash = value => crypto.createHash('sha256').update(String(value || '')).digest('hex');
 const publicReferralCode = uid => crypto.createHash('sha256').update(`qelumi-referral|${uid}`).digest('base64url').slice(0, 10).toUpperCase();
@@ -488,7 +490,7 @@ async function callGemini(body, { model = PRIMARY_MODEL, thinkingLevel = PRIMARY
     } finally { clearTimeout(timeout); }
 }
 
-async function runLearningFeature(feature, input, uid) {
+async function runLearningFeatureUncached(feature, input, uid) {
     const body = buildLearningRequest(feature, input);
     const languageMetrics = {
         fromLang:String(input?.sourceLang || input?.practiceLang || input?.language || '').toUpperCase(),
@@ -499,8 +501,17 @@ async function runLearningFeature(feature, input, uid) {
     let operation = `learning_${feature}_primary`;
     let started = performance.now(); let fallbackUsed = false;
     try {
-        data = await callGemini(body, { model, thinkingLevel, timeoutMs:25_000 });
+        data = await callGemini(body, {
+            model, thinkingLevel,
+            timeoutMs:feature === 'focused_practice' ? 50_000 : 25_000
+        });
         result = parseGeminiJSON(data);
+        const qualityIssues = feature === 'focused_practice' ? focusedPracticeQualityIssues(result) : [];
+        if (qualityIssues.length) {
+            const error = new Error(`Focused practice was incomplete: ${qualityIssues.join('; ')}.`);
+            error.code = 'FOCUSED_PRACTICE_INCOMPLETE';
+            throw error;
+        }
     } catch (primaryError) {
         recordUsage(uid, `${operation}_error`, {
             ...languageMetrics, model, thinkingLevel,
@@ -511,8 +522,18 @@ async function runLearningFeature(feature, input, uid) {
         model = FALLBACK_MODEL; thinkingLevel = FALLBACK_THINKING;
         operation = `learning_${feature}_fallback`;
         started = performance.now();
-        data = await callGemini(body, { model, thinkingLevel, timeoutMs:35_000 });
+        data = await callGemini(body, {
+            model, thinkingLevel,
+            timeoutMs:feature === 'focused_practice' ? 75_000 : 35_000
+        });
         result = parseGeminiJSON(data);
+        const qualityIssues = feature === 'focused_practice' ? focusedPracticeQualityIssues(result) : [];
+        if (qualityIssues.length) {
+            const error = new Error(`Focused practice was incomplete: ${qualityIssues.join('; ')}.`);
+            error.status = 502;
+            error.code = 'FOCUSED_PRACTICE_INCOMPLETE';
+            throw error;
+        }
     }
     const usage = { ...measuredGeminiUsage(data, started, model, thinkingLevel), ...languageMetrics };
     recordUsage(uid, operation, usage).catch(() => {});
@@ -523,6 +544,30 @@ async function runLearningFeature(feature, input, uid) {
             latencyMs:usage.latencyMs
         }
     };
+}
+
+async function runLearningFeature(feature, input, uid) {
+    if (feature !== 'focused_practice') return runLearningFeatureUncached(feature, input, uid);
+    const cacheKey = stableHash(JSON.stringify({
+        sourceLang:input?.sourceLang,
+        targetLang:input?.targetLang,
+        query:input?.query,
+        translations:input?.translations,
+        meanings:input?.meanings,
+        wordFamily:input?.wordFamily
+    }));
+    const now = Date.now();
+    const cached = focusedPracticeCache.get(cacheKey);
+    if (cached?.expiresAt > now) return JSON.parse(JSON.stringify(cached.value));
+    if (cached) focusedPracticeCache.delete(cacheKey);
+    if (focusedPracticeFlights.has(cacheKey)) return focusedPracticeFlights.get(cacheKey);
+    const flight = runLearningFeatureUncached(feature, input, uid).then(value => {
+        focusedPracticeCache.set(cacheKey, { value, expiresAt:Date.now() + 24 * 60 * 60_000 });
+        while (focusedPracticeCache.size > 400) focusedPracticeCache.delete(focusedPracticeCache.keys().next().value);
+        return JSON.parse(JSON.stringify(value));
+    }).finally(() => focusedPracticeFlights.delete(cacheKey));
+    focusedPracticeFlights.set(cacheKey, flight);
+    return flight;
 }
 
 function liveTranslationRequest(text, sourceLang, targetLang) {
@@ -760,6 +805,7 @@ app.get('/health', (_req, res) => res.json({
         automaticConversationTranslation:true, automaticConversationPlayback:true,
         readAloudVoiceControls:true, readAloudVoiceInstallHelp:true,
         normalizedAndroidVoiceLocales:true,
+        focusedPracticeBanks:true, focusedPracticeFiveRounds:true,
         completeTranslationFirst:true,
         onDemandTranslationDetails:true,
         seamlessDetailReveal:true,
@@ -1278,6 +1324,10 @@ app.post('/api/learning/writing-coach', requireUser,
     rateLimit({ windowMs:60 * 60_000, max:40, key:req => `writing-coach:${req.user.uid}` }),
     enforceAllowance('aiPracticeSessions'),
     learningRoute('writing_coach'));
+app.post('/api/learning/focused-practice', requireUser,
+    rateLimit({ windowMs:60 * 60_000, max:12, key:req => `focused-practice:${req.user.uid}` }),
+    enforceAllowance('aiPracticeSessions'),
+    learningRoute('focused_practice'));
 
 app.post('/api/feedback', requireUser, rateLimit({ windowMs:60 * 60_000, max:10, key:req => `feedback:${req.user.uid}` }), async (req, res) => {
     const category = feedbackCategories.has(req.body?.category) ? req.body.category : (feedbackCategories.has(req.body?.type) ? req.body.type : 'other');
