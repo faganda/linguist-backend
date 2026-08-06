@@ -15,10 +15,11 @@ import {
 import {
     buildLearningRequest, focusedPracticeQualityIssues, summarizePerformanceEvents
 } from './learning-service.js';
+import { planHistoryDeletion } from './history-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '5.0.5';
+const BACKEND_VERSION = '5.0.6';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -809,9 +810,13 @@ app.get('/health', (_req, res) => res.json({
         listeningSpeechOrChoice:true,
         focusedPronunciationForms:true,
         focusedShadowingFeedback:true,
+        focusedTypedEnterSubmission:true,
+        resolvedSpeechAttempts:true,
         completeTranslationFirst:true,
         onDemandTranslationDetails:true,
         isolatedDetailAndContextGeneration:true,
+        detailContextReadinessIsolation:true,
+        deterministicDetailFallback:true,
         splitTenExampleRepair:true,
         seamlessDetailReveal:true,
         meaningAlignedContextExamples:true,
@@ -831,6 +836,10 @@ app.get('/health', (_req, res) => res.json({
         authenticatedAccountDeletion:true,
         simplifiedNavigation:true,
         unifiedLibrary:true,
+        automaticHistoryPagination:true,
+        associatedExampleDeletion:true,
+        sequentialHistoryRenumbering:true,
+        translationHistoryBadges:true,
         personalisedOnboarding:true,
         qelumiPath:true,
         purposeCollections:true,
@@ -999,6 +1008,48 @@ app.delete('/api/account', requireUser,
         } catch (error) {
             if (error.code === 'auth/user-not-found') return res.json({ ok:true, deleted:true });
             res.status(error.status || 500).json({ error:{ code:error.code || 'ACCOUNT_DELETION_FAILED', message:error.message || 'The account could not be deleted.' } });
+        }
+    });
+
+app.delete('/api/history/:id', requireUser, requireRegisteredUser,
+    rateLimit({ windowMs:60 * 60_000, max:30, key:req => `history-delete:${req.user.uid}` }),
+    async (req, res) => {
+        try {
+            const historyId = String(req.params.id || '');
+            if (!/^[A-Za-z0-9_-]{1,128}$/.test(historyId)) {
+                return res.status(400).json({error:{code:'INVALID_HISTORY_ID', message:'That history item is invalid.'}});
+            }
+            const deleteExamples = req.body?.deleteExamples === true;
+            const userReference = db.collection('artifacts').doc(APP_ID).collection('users').doc(req.user.uid);
+            const historyCollection = userReference.collection('history');
+            const savedCollection = userReference.collection('saved_examples');
+            const [historySnapshot, savedSnapshot] = await Promise.all([
+                historyCollection.get(),
+                deleteExamples ? savedCollection.get() : Promise.resolve(null)
+            ]);
+            const historyEntries = historySnapshot.docs.map(document => ({id:document.id, ...document.data()}));
+            const savedExamples = savedSnapshot?.docs.map(document => ({id:document.id, ...document.data()})) || [];
+            const plan = planHistoryDeletion({historyId, historyEntries, savedExamples, deleteExamples});
+            if (!plan) return res.status(404).json({error:{code:'HISTORY_NOT_FOUND', message:'That history item no longer exists.'}});
+
+            const writer = db.bulkWriter();
+            writer.onWriteError(error => error.failedAttempts < 3);
+            writer.delete(historyCollection.doc(historyId));
+            if (deleteExamples) {
+                plan.deletedExampleIds.forEach(id => writer.delete(savedCollection.doc(id)));
+                plan.historyNumberUpdates.forEach(update => writer.update(historyCollection.doc(update.id), {wordNumber:update.wordNumber}));
+                plan.savedExampleNumberUpdates.forEach(update => writer.update(savedCollection.doc(update.id), {wordNumber:update.wordNumber}));
+            }
+            await writer.close();
+            res.json({
+                ok:true,
+                deletedHistory:1,
+                deletedExamples:plan.deletedExampleIds.length,
+                renumberedHistory:plan.historyNumberUpdates.length,
+                renumberedExamples:plan.savedExampleNumberUpdates.length
+            });
+        } catch (error) {
+            res.status(error.status || 500).json({error:{code:error.code || 'HISTORY_DELETE_FAILED', message:error.message || 'The history item could not be deleted.'}});
         }
     });
 

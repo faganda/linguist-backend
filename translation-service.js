@@ -19,7 +19,7 @@ export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less com
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 export const ANTONYM_STATUS_VALUES = Object.freeze(['available', 'no-direct-antonym']);
 
-export const DICTIONARY_SCHEMA_VERSION = 22;
+export const DICTIONARY_SCHEMA_VERSION = 23;
 export const PREVIEW_SCHEMA_VERSION = 6;
 export const TRANSLATION_LIST_SCHEMA_VERSION = 4;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
@@ -1361,6 +1361,61 @@ function detailsDraftFromCore(result) {
     };
 }
 
+const ETYMOLOGY_UNAVAILABLE = Object.freeze({
+    EN:query => `No sufficiently reliable etymological account is available for the source entry “${query}”. Qelumi will not invent one.`,
+    FR:query => `Aucune origine étymologique suffisamment fiable n’est disponible pour l’entrée source « ${query} ». Qelumi n’en inventera pas.`,
+    ES:query => `No hay información etimológica suficientemente fiable para la entrada de origen «${query}». Qelumi no inventará una.`,
+    DE:query => `Für den Ausgangseintrag „${query}“ liegen keine hinreichend zuverlässigen etymologischen Angaben vor. Qelumi erfindet keine.`,
+    IT:query => `Non sono disponibili informazioni etimologiche sufficientemente affidabili per la voce di partenza «${query}». Qelumi non ne inventerà.`,
+    PT:query => `Não há informação etimológica suficientemente fiável para a entrada de origem «${query}». O Qelumi não inventará uma.`,
+    ZH:query => `目前没有关于源词条“${query}”的足够可靠的词源资料。Qelumi 不会编造词源。`,
+    JA:query => `原文の項目「${query}」について、十分に信頼できる語源情報は確認できません。Qelumi は語源を創作しません。`,
+    KO:query => `원문 항목 “${query}”에 대해 충분히 신뢰할 수 있는 어원 정보가 없습니다. Qelumi는 어원을 만들어 내지 않습니다.`,
+    RU:query => `Для исходной единицы «${query}» нет достаточно надёжных этимологических сведений. Qelumi не будет их выдумывать.`,
+    AR:query => `لا تتوفر معلومات اشتقاقية موثوقة بما يكفي للمدخل الأصلي «${query}». لن يختلق Qelumi أصلاً للكلمة.`,
+    SW:query => `Hakuna maelezo ya asili ya neno yanayotegemeka vya kutosha kwa ingizo chanzo “${query}”. Qelumi haitabuni maelezo hayo.`
+});
+
+export function deterministicDetailsFallback(context, translationList, candidate = {}) {
+    const list = normalizePreviewResult(translationList, context);
+    const sourceCode = cleanCode(context.fromLang) || 'EN';
+    const targetCode = cleanCode(context.toLang) || 'EN';
+    const sourceFallback = ETYMOLOGY_UNAVAILABLE[sourceCode](context.query);
+    const targetFallback = context.definitionsOnly ? '' : ETYMOLOGY_UNAVAILABLE[targetCode](context.query);
+    const bilingual = value => ({
+        sourceLang:cleanTextArray(value?.sourceLang),
+        targetLang:context.definitionsOnly ? [] : cleanTextArray(value?.targetLang)
+    });
+    const antonyms = candidate?.antonyms;
+    const validAntonyms = ANTONYM_STATUS_VALUES.includes(antonyms?.status)
+        && Array.isArray(antonyms?.sourceLang) && Array.isArray(antonyms?.targetLang)
+        && (antonyms.status === 'no-direct-antonym'
+            || (antonyms.sourceLang.some(hasText) && (context.definitionsOnly || antonyms.targetLang.some(hasText))));
+    return {
+        learningMetadata:normalizeLearningMetadata(candidate?.learningMetadata, context.definitionsOnly === true),
+        etymology:{
+            sourceLang:cleanText(candidate?.etymology?.sourceLang) || sourceFallback,
+            targetLang:context.definitionsOnly ? '' : (cleanText(candidate?.etymology?.targetLang) || targetFallback)
+        },
+        definitions:{
+            sourceLang:(list.meanings || []).map(meaning => meaning.sourceDefinition).filter(hasText),
+            targetLang:context.definitionsOnly ? [] : (list.meanings || []).map(meaning => meaning.targetDefinition).filter(hasText)
+        },
+        synonyms:bilingual(candidate?.synonyms),
+        antonyms:validAntonyms ? {
+            status:antonyms.status,
+            ...bilingual(antonyms)
+        } : {status:'no-direct-antonym', sourceLang:[], targetLang:[]},
+        similarPhrases:bilingual(candidate?.similarPhrases),
+        collocations:bilingual(candidate?.collocations),
+        usageWarnings:bilingual(candidate?.usageWarnings),
+        grammarNotes:bilingual(candidate?.grammarNotes),
+        regionalVariants:Array.isArray(candidate?.regionalVariants) ? candidate.regionalVariants : [],
+        wordFamily:Array.isArray(candidate?.wordFamily) ? candidate.wordFamily : [],
+        minimalPairs:Array.isArray(candidate?.minimalPairs) ? candidate.minimalPairs : []
+    };
+}
+
 export function buildDetailsRequest(context, translationList, { repairSource = null } = {}) {
     const fromName = LANGUAGES[cleanCode(context.fromLang)];
     const toName = LANGUAGES[cleanCode(context.toLang)];
@@ -2351,6 +2406,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
         let detailPrimary;
         let detailFallback;
+        let deterministicDetailsUsed = false;
         let conjugationPrimary;
         let conjugationFallback;
         const fallbackReasons = [];
@@ -2380,31 +2436,43 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
             if (!details || detailIssues.length) {
                 fallbackReasons.push(`details:${detailIssues.join('|') || 'primary_failed'}`);
-                detailFallback = await modelJSON({
-                    model:FALLBACK_MODEL,
-                    thinkingLevel:FALLBACK_THINKING,
-                    body:buildDetailsRequest(context, list, details ? {
-                        repairSource:{
-                            result:composeCoreFromTranslationList(list, details, [], context),
-                            issues:detailIssues
-                        }
-                    } : undefined),
-                    timeoutMs:fallbackTimeoutMs,
-                    operation:'translation_details_fallback',
-                    uid,
-                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
-                });
-                details = detailFallback.result;
-                const repaired = composeCoreFromTranslationList(list, details, [], context);
-                detailIssues = coreQualityIssues(repaired, context)
-                    .filter(issue => !isConjugationQualityIssue(issue));
+                try {
+                    detailFallback = await modelJSON({
+                        model:FALLBACK_MODEL,
+                        thinkingLevel:FALLBACK_THINKING,
+                        body:buildDetailsRequest(context, list, details ? {
+                            repairSource:{
+                                result:composeCoreFromTranslationList(list, details, [], context),
+                                issues:detailIssues
+                            }
+                        } : undefined),
+                        timeoutMs:fallbackTimeoutMs,
+                        operation:'translation_details_fallback',
+                        uid,
+                        metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                    });
+                    details = detailFallback.result;
+                    const repaired = composeCoreFromTranslationList(list, details, [], context);
+                    detailIssues = coreQualityIssues(repaired, context)
+                        .filter(issue => !isConjugationQualityIssue(issue));
+                } catch (error) {
+                    detailIssues = [`fallback details: ${error.code || error.message || 'failed'}`];
+                }
             }
 
             if (detailIssues.length) {
-                const error = new Error(`The dictionary details were incomplete: ${detailIssues.join(', ')}.`);
-                error.status = 502;
-                error.code = 'DETAILS_INCOMPLETE';
-                throw error;
+                fallbackReasons.push(`details:deterministic_safe_fallback:${detailIssues.join('|')}`);
+                deterministicDetailsUsed = true;
+                details = deterministicDetailsFallback(context, list, details);
+                const deterministicIssues = coreQualityIssues(
+                    composeCoreFromTranslationList(list, details, [], context), context
+                ).filter(issue => !isConjugationQualityIssue(issue));
+                if (deterministicIssues.length) {
+                    const error = new Error(`The dictionary details were incomplete: ${deterministicIssues.join(', ')}.`);
+                    error.status = 502;
+                    error.code = 'DETAILS_INCOMPLETE';
+                    throw error;
+                }
             }
             return details;
         })();
@@ -2479,7 +2547,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         if (prior) result = mergeContextExamples(result, prior);
 
         const calls = [detailPrimary, detailFallback, conjugationPrimary, conjugationFallback].filter(Boolean);
-        const fallbackUsed = !!detailFallback || !!conjugationFallback;
+        const fallbackUsed = !!detailFallback || !!conjugationFallback || deterministicDetailsUsed;
         const fallbackReason = fallbackReasons.join(',');
         result = await saveCachedResult(context, result, {
             model:calls[0]?.model || PRIMARY_MODEL,
