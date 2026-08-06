@@ -355,6 +355,14 @@ export const EXAMPLES_RESPONSE_SCHEMA = Object.freeze({
     required:['examples']
 });
 
+export function examplesResponseSchema(count) {
+    const expected = Math.max(1, Math.min(10, Number(count) || 1));
+    const schema = clone(EXAMPLES_RESPONSE_SCHEMA);
+    schema.properties.examples.minItems = expected;
+    schema.properties.examples.maxItems = expected;
+    return schema;
+}
+
 export const DISTRACTOR_RESPONSE_SCHEMA = Object.freeze({
     type:'object', additionalProperties:false,
     properties:{ distractors:textArray(4) }, required:['distractors']
@@ -1221,6 +1229,9 @@ export function exampleQualityIssues(example, context) {
     const issues = [];
     const original = cleanText(example?.original);
     const translated = cleanText(example?.translated);
+    const normalizedExampleText = value => normalizeDictionaryQuery(value)
+        .replace(/[’‘`]/gu, "'")
+        .replace(/[‐‑‒–—]/gu, '-');
     if (example?.complete !== true) issues.push('model marked sentence incomplete');
     if (original.length < 6) issues.push('source example too short');
     if (!context.definitionsOnly && translated.length < 6) issues.push('translation too short');
@@ -1230,11 +1241,11 @@ export function exampleQualityIssues(example, context) {
         const pattern = danglingEndPatterns[cleanCode(code)];
         if (pattern?.test(text)) issues.push(`${label} ends with an incomplete phrase`);
     }
-    if (!hasText(example?.sourceSnippet) || !normalizeDictionaryQuery(original).includes(normalizeDictionaryQuery(example.sourceSnippet))) {
+    if (!hasText(example?.sourceSnippet) || !normalizedExampleText(original).includes(normalizedExampleText(example.sourceSnippet))) {
         issues.push('source snippet not found in example');
     }
     if (!context.definitionsOnly) {
-        if (!hasText(example?.targetTranslatedSnippet) || !normalizeDictionaryQuery(translated).includes(normalizeDictionaryQuery(example.targetTranslatedSnippet))) {
+        if (!hasText(example?.targetTranslatedSnippet) || !normalizedExampleText(translated).includes(normalizedExampleText(example.targetTranslatedSnippet))) {
             issues.push('target snippet not found in translation');
         }
         if (!hasText(example?.blankedTranslation) || !String(example.blankedTranslation).includes('___')) issues.push('missing blanked translation');
@@ -1583,13 +1594,13 @@ ${exactExpressionGuidance(context)}
 
 ${context.definitionsOnly ? `Write original and explanation in ${fromName}. Keep translated, targetTranslatedSnippet and blankedTranslation empty.` : `Write original in ${fromName}, translate it fully into ${toName}, and explain the usage in ${fromName}. targetTranslatedSnippet must be an exact substring of translated. blankedTranslation must equal the full translation with that exact substring replaced by ___.`}
 
-Every example must be materially different in situation and wording from the other examples in this response.${avoidExamples.length ? ` Do not repeat or closely paraphrase any of these already accepted source sentences: ${JSON.stringify(avoidExamples)}` : ''}${batchFocus ? `\nDIVERSITY FOCUS FOR THIS REPAIR BATCH: ${batchFocus}` : ''}
+Every example must be materially different in situation and wording from the other examples in this response.${avoidExamples.length ? ` Discard the prior accepted or rejected sentences below and create completely new replacements; do not repeat, repair, or closely paraphrase them: ${JSON.stringify(avoidExamples)}` : ''}${batchFocus ? `\nDIVERSITY FOCUS FOR THIS REPLACEMENT BATCH: ${batchFocus}` : ''}
 
-Do not create distractors. Return strict JSON matching the schema.${repairIssues.length ? ` Repair these prior defects: ${repairIssues.join('; ')}.` : ''}`;
+Do not create distractors. Return strict JSON matching the schema.${repairIssues.length ? ` The earlier candidates had these defects; discard those candidates and replace them with new examples: ${repairIssues.join('; ')}.` : ''}`;
     return {
         contents:[{ role:'user', parts:[{ text:`Entry: ${context.query}\nAssigned meaning label: ${contextItem.meaningLabel || meaning.label}\nAssigned source definition: ${contextItem.sourceDefinition || meaning.sourceDefinition}\nAssigned target definition: ${contextItem.targetDefinition || meaning.targetDefinition}\nAssigned part of speech: ${contextItem.meaningPartOfSpeech || meaning.partOfSpeech}\nAssigned register: ${contextItem.meaningRegister || meaning.register}\nExcluded alternate meanings (do not illustrate these): ${JSON.stringify(otherMeanings)}` }] }],
         systemInstruction:{ parts:[{ text:system }] },
-        generationConfig:{ responseMimeType:'application/json', responseJsonSchema:EXAMPLES_RESPONSE_SCHEMA, maxOutputTokens:8192 }
+        generationConfig:{ responseMimeType:'application/json', responseJsonSchema:examplesResponseSchema(count), maxOutputTokens:8192 }
     };
 }
 
@@ -2830,6 +2841,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     async function generateContextExamples(context, coreResult, contextItem, count, uid) {
         let primary;
         const accepted = [];
+        const rejectedSourceSentences = new Set();
         const detectedIssues = [];
         const fallbackCalls = [];
         const exampleKey = value => normalizeDictionaryQuery(value)
@@ -2848,6 +2860,7 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 if (!key) issues.push('missing source sentence');
                 if (key && seen.has(key)) issues.push('duplicate source sentence');
                 if (issues.length) {
+                    if (hasText(example?.original)) rejectedSourceSentences.add(cleanText(example.original));
                     detectedIssues.push(...issues.map(issue => `${batchLabel} example ${index + 1}: ${issue}`));
                     return;
                 }
@@ -2855,21 +2868,31 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 accepted.push(example);
             });
         };
-        try {
-            primary = await modelJSON({
-                model:PRIMARY_MODEL, thinkingLevel:PRIMARY_THINKING,
-                body:buildExamplesRequest(context, coreResult, contextItem, count), timeoutMs:primaryTimeoutMs,
-                operation:'translation_examples_primary', uid,
-                metrics:{ fromLang:context.fromLang, toLang:context.toLang }
-            });
-            acceptCandidates(primary.result?.examples, count, 'primary');
-        } catch (error) {
-            detectedIssues.push(`primary: ${error.code || error.message || 'example request failed'}`);
+        const cachedExamples = Array.isArray(contextItem?.examples) ? contextItem.examples : [];
+        if (cachedExamples.length) {
+            acceptCandidates(cachedExamples, cachedExamples.length, 'previously accepted');
+        }
+        const primaryRequestCount = count - accepted.length;
+        if (primaryRequestCount > 0) {
+            try {
+                primary = await modelJSON({
+                    model:PRIMARY_MODEL, thinkingLevel:PRIMARY_THINKING,
+                    body:buildExamplesRequest(context, coreResult, contextItem, primaryRequestCount, {
+                        avoidExamples:[...accepted.map(example => example.original), ...rejectedSourceSentences],
+                        batchFocus:'Create fresh situations for every missing example; do not edit a rejected sentence.'
+                    }), timeoutMs:primaryTimeoutMs,
+                    operation:'translation_examples_primary', uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                acceptCandidates(primary.result?.examples, primaryRequestCount, 'primary');
+            } catch (error) {
+                detectedIssues.push(`primary: ${error.code || error.message || 'example request failed'}`);
+            }
         }
 
         const requestFallback = async (requestedCount, suffix, batchFocus) => {
             if (requestedCount < 1) return null;
-            const avoidExamples = accepted.map(example => example.original);
+            const avoidExamples = [...accepted.map(example => example.original), ...rejectedSourceSentences];
             try {
                 const response = await modelJSON({
                     model:FALLBACK_MODEL, thinkingLevel:FALLBACK_THINKING,
@@ -2915,15 +2938,15 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             if (finalRepair) acceptCandidates(finalRepair.response.result?.examples, finalRepair.requestedCount, 'final repair');
         }
 
-        if (accepted.length !== count) {
-            const conciseIssues = detectedIssues.slice(-30);
-            const error = new Error(`Context examples were incomplete: accepted ${accepted.length} of ${count}. ${conciseIssues.join(', ')}.`);
-            error.status = 502; error.code = 'EXAMPLES_INCOMPLETE'; throw error;
-        }
+        const incomplete = accepted.length !== count;
         return {
             context:{ ...contextItem, examples:accepted.map(example => ({ ...example, distractors:[] })) },
             modelCalls:[primary, ...fallbackCalls].filter(Boolean), fallbackUsed:fallbackCalls.length > 0,
-            fallbackReason:fallbackCalls.length ? 'partial_or_invalid_examples_repaired' : ''
+            fallbackReason:incomplete ? 'partial_examples_returned_for_background_replacement'
+                : fallbackCalls.length ? 'partial_or_invalid_examples_repaired' : '',
+            incomplete,
+            missingCount:Math.max(0, count - accepted.length),
+            issues:detectedIssues.slice(-30)
         };
     }
 
@@ -2934,6 +2957,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         );
         return {
             contexts:generated.map(item => item.context),
+            contextsReady:generated.every(item => !item.incomplete),
+            missingExamples:generated.reduce((total, item) => total + Number(item.missingCount || 0), 0),
             fallbackUsed:generated.some(item => item.fallbackUsed),
             fallbackReason:generated
                 .filter(item => item.fallbackReason)
@@ -2979,12 +3004,14 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
             preserveExamples:false,
             incrementUse:false
         });
+        const contextsReady = contextsAreComplete(saved, context);
         return {
             contexts:saved.contexts,
             meta:{
                 source:'generated',
                 cacheStatus:'miss',
-                contextsReady:true,
+                contextsReady,
+                missingExamples:contextsReady ? 0 : Number(batch.missingExamples || 0),
                 fallbackUsed:batch.fallbackUsed,
                 fallbackReason:batch.fallbackReason,
                 latencyMs:Math.round(performance.now() - started),
