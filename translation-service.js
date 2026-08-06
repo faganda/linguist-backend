@@ -19,9 +19,9 @@ export const FREQUENCY_BANDS = Object.freeze(['Very common', 'Common', 'Less com
 export const MODALITY_VALUES = Object.freeze(['Spoken', 'Written', 'Both']);
 export const ANTONYM_STATUS_VALUES = Object.freeze(['available', 'no-direct-antonym']);
 
-export const DICTIONARY_SCHEMA_VERSION = 21;
-export const PREVIEW_SCHEMA_VERSION = 5;
-export const TRANSLATION_LIST_SCHEMA_VERSION = 3;
+export const DICTIONARY_SCHEMA_VERSION = 22;
+export const PREVIEW_SCHEMA_VERSION = 6;
+export const TRANSLATION_LIST_SCHEMA_VERSION = 4;
 export const PRIMARY_MODEL = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.1-flash-lite';
 export const PRIMARY_THINKING = process.env.GEMINI_PRIMARY_THINKING || 'minimal';
 export const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
@@ -474,6 +474,12 @@ function exactExpressionGuidance(context) {
     if (cleanCode(context.fromLang) === 'EN' && exact === "it's got bells on") {
         return `\nKNOWN EXPRESSION DISAMBIGUATION: "It's got bells on" is conventionally the elliptical final clause of British "Pull the other one—it's got bells on", used to express disbelief (roughly, "I don't believe you"). Analyse that exact idiomatic use. Do not conflate it with "with bells on" (eagerly/enthusiastically), "bells and whistles" (extra features), or a literal object wearing bells.`;
     }
+    if (cleanCode(context.fromLang) === 'EN' && exact === 'icing') {
+        return `\nKNOWN POLYSEMY CHECK: English "icing" has the literal culinary noun sense (cake topping; typically French "glaçage") and an established figurative noun sense, an attractive or pleasing but inessential addition (often French "cerise sur le gâteau" according to context). Keep those senses separate and include both. Also retain a genuine verbal/participial use only when it is practically established for the exact input.`;
+    }
+    if (cleanCode(context.fromLang) === 'EN' && /^\p{L}+(?:ing)$/u.test(exact)) {
+        return `\nENGLISH -ING COVERAGE CHECK: distinguish a lexical noun or adjective from a productive gerund/present-participle use, and audit established figurative or idiomatic extensions. Include each genuinely useful class and sense; do not assume the most literal noun sense is the whole entry.`;
+    }
     return '';
 }
 
@@ -792,6 +798,20 @@ function primaryTranslationListCoverageRisks(result, context) {
     if (meanings.length === 1 && translations.length === 1
         && normalizeDictionaryQuery(translations[0]) === query) {
         risks.push('identity-only translation may have omitted ordinary lexical senses');
+    }
+    if (cleanCode(context.fromLang) === 'EN' && /^\p{L}+ing$/u.test(query)
+        && meanings.length < 2) {
+        risks.push('English -ing entry needs an independent lexical-noun, adjective, verbal and figurative-sense audit');
+    }
+    if (cleanCode(context.fromLang) === 'EN' && query === 'icing') {
+        const inventory = normalizeDictionaryQuery(JSON.stringify({translations, meanings}))
+            .normalize('NFD').replace(/[\u0300-\u036f]/gu, '');
+        if (!/(?:inessential|addition|extra|figurative|cerise sur le gateau)/u.test(inventory)) {
+            risks.push('icing is missing its established figurative attractive-but-inessential-addition sense');
+        }
+        if (!/(?:cake|topping|culinary|glacage)/u.test(inventory)) {
+            risks.push('icing is missing its literal culinary sense');
+        }
     }
     return risks;
 }
@@ -1254,7 +1274,7 @@ First decide whether the exact input is genuinely established in requested sourc
 
 Validation fields must be internally consistent. validLanguages is supporting evidence and need not be exhaustive. If validLanguages is nonempty, wordExists must be true. Set wordExists=false only for genuine gibberish. If existsInRequestedLanguage=false, leave partOfSpeech, formality, mainTranslation, pronunciationGuide and meanings empty. Do not translate a source-language mismatch.
 
-For an accepted entry, identify every established, practically useful grammatical class and distinct common sense. Return every class in partOfSpeech and a separate meanings item for every useful sense, each with a natural semantic label, exact English partOfSpeech, register, concise ${fromName} sourceDefinition, ${definitionsOnly ? 'an empty targetDefinition and empty translations' : `a faithful ${toName} targetDefinition and all appropriate ${toName} translations`}. Do not stop after the first sense and do not shorten the result into a teaser. Before answering, explicitly audit noun, verb, adjective, adverb, interjection, idiom, specialist-domain and proper-name uses, retaining only genuinely established ones. For a single alphabetic word, do not let a famous capitalised name suppress ordinary lowercase lexical uses or let an ordinary word suppress a genuine proper-name use. For example, English "trump" to French must cover the surname/name "Trump", the card or figurative noun "atout", the card-game verb "couper", and the verbs meaning "surpasser" or "l’emporter sur"; returning only "Trump" is incomplete.
+For an accepted entry, identify every established, practically useful grammatical class and distinct common sense. Return every class in partOfSpeech and a separate meanings item for every useful sense, each with a natural semantic label, exact English partOfSpeech, register, concise ${fromName} sourceDefinition, ${definitionsOnly ? 'an empty targetDefinition and empty translations' : `a faithful ${toName} targetDefinition and all appropriate ${toName} translations`}. Do not stop after the first sense and do not shorten the result into a teaser. Before answering, explicitly audit noun, verb, adjective, adverb, interjection, literal, figurative, idiomatic, specialist-domain and proper-name uses, retaining only genuinely established ones. A lexicalized figurative extension is a separate sense even when it shares a spelling with a concrete object or action. For a single alphabetic word, do not let a famous capitalised name suppress ordinary lowercase lexical uses or let an ordinary word suppress a genuine proper-name use. For example, English "trump" to French must cover the surname/name "Trump", the card or figurative noun "atout", the card-game verb "couper", and the verbs meaning "surpasser" or "l’emporter sur"; returning only "Trump" is incomplete. English "icing" must keep its literal culinary sense and its figurative attractive-but-inessential-addition sense separate.
 
 mainTranslation must be the de-duplicated union of every translation under meanings, and every mainTranslation item must appear under its correct meaning. Never repeat two meanings with the same semantic label and the same explanation. If a multiword input is a plausible literal phrase, return each distinct established or compositional meaning once; if it is instead a clear near-miss for a common expression, use suggestedCorrection rather than inventing duplicate senses. A multiword entry must receive a structural label such as Noun phrase, Compound noun, Verb phrase, Phrasal verb, Idiomatic expression, Clause or Sentence rather than a bare single-word class. Use natural semantic labels such as "Physical movement", never machine keys such as verb_connect.
 ${exactExpressionGuidance(context)}
@@ -1489,7 +1509,7 @@ export function buildValidationRequest(context, primaryResult, issues = []) {
     };
 }
 
-export function buildExamplesRequest(context, coreResult, contextItem, count, { repairIssues = [] } = {}) {
+export function buildExamplesRequest(context, coreResult, contextItem, count, { repairIssues = [], avoidExamples = [] } = {}) {
     const fromName = LANGUAGES[cleanCode(context.fromLang)];
     const toName = LANGUAGES[cleanCode(context.toLang)];
     const meaning = coreResult.meanings?.[contextItem.meaningIndex] || {};
@@ -1503,6 +1523,8 @@ export function buildExamplesRequest(context, coreResult, contextItem, count, { 
     const system = `Generate exactly ${count} complete, natural, diverse examples for the one specified meaning of the exact Qelumi entry. Every example must illustrate this meaning and no alternate sense. Contrast the assigned definition against every excluded meaning supplied below before writing. Topic similarity is not enough: the event described by each sentence must logically instantiate the assigned sourceDefinition and targetDefinition. Never attach sport, food, computing or another domain merely because that domain appears in a different sense of the same spelling. Every source sentence must contain a natural inflected or exact form of the entry, and sourceSnippet must copy that exact form from original. Never end a sentence on an article, preposition, conjunction, ellipsis, dash, colon, or other unfinished fragment. Set complete=true only after checking both sentences are syntactically complete and semantically match the assigned meaning.
 
 ${context.definitionsOnly ? `Write original and explanation in ${fromName}. Keep translated, targetTranslatedSnippet and blankedTranslation empty.` : `Write original in ${fromName}, translate it fully into ${toName}, and explain the usage in ${fromName}. targetTranslatedSnippet must be an exact substring of translated. blankedTranslation must equal the full translation with that exact substring replaced by ___.`}
+
+Every example must be materially different in situation and wording from the other examples in this response.${avoidExamples.length ? ` Do not repeat or closely paraphrase any of these already accepted source sentences: ${JSON.stringify(avoidExamples)}` : ''}
 
 Do not create distractors. Return strict JSON matching the schema.${repairIssues.length ? ` Repair these prior defects: ${repairIssues.join('; ')}.` : ''}`;
     return {
@@ -2735,6 +2757,18 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function generateContextExamples(context, coreResult, contextItem, count, uid) {
         let primary; let examples; let issues = [];
+        const collectionIssues = (items, expected, avoid = []) => {
+            const detected = [];
+            if (items.length !== expected) detected.push(`expected ${expected} examples, received ${items.length}`);
+            items.forEach((example, index) => detected.push(...exampleQualityIssues(example, context).map(issue => `example ${index + 1}: ${issue}`)));
+            const seen = new Set(avoid.map(item => normalizeDictionaryQuery(item)));
+            items.forEach((example, index) => {
+                const key = normalizeDictionaryQuery(example?.original);
+                if (key && seen.has(key)) detected.push(`example ${index + 1}: duplicate source sentence`);
+                if (key) seen.add(key);
+            });
+            return detected;
+        };
         try {
             primary = await modelJSON({
                 model:PRIMARY_MODEL, thinkingLevel:PRIMARY_THINKING,
@@ -2743,22 +2777,39 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 metrics:{ fromLang:context.fromLang, toLang:context.toLang }
             });
             examples = Array.isArray(primary.result?.examples) ? primary.result.examples.slice(0, count) : [];
-            if (examples.length !== count) issues.push(`expected ${count} examples, received ${examples.length}`);
-            examples.forEach((example, index) => issues.push(...exampleQualityIssues(example, context).map(issue => `example ${index + 1}: ${issue}`)));
+            issues = collectionIssues(examples, count);
         } catch (error) { issues = [error.code || error.message || 'example request failed']; }
 
-        let fallback;
+        const fallbackCalls = [];
         if (issues.length) {
-            fallback = await modelJSON({
-                model:FALLBACK_MODEL, thinkingLevel:FALLBACK_THINKING,
-                body:buildExamplesRequest(context, coreResult, contextItem, count, { repairIssues:issues }), timeoutMs:fallbackTimeoutMs,
-                operation:'translation_examples_fallback', uid,
-                metrics:{ fromLang:context.fromLang, toLang:context.toLang }
-            });
-            examples = Array.isArray(fallback.result?.examples) ? fallback.result.examples.slice(0, count) : [];
-            issues = [];
-            if (examples.length !== count) issues.push(`expected ${count} examples, received ${examples.length}`);
-            examples.forEach((example, index) => issues.push(...exampleQualityIssues(example, context).map(issue => `example ${index + 1}: ${issue}`)));
+            const requestFallback = async (requestedCount, avoidExamples = [], suffix = '') => {
+                const response = await modelJSON({
+                    model:FALLBACK_MODEL, thinkingLevel:FALLBACK_THINKING,
+                    body:buildExamplesRequest(context, coreResult, contextItem, requestedCount, { repairIssues:issues, avoidExamples }), timeoutMs:fallbackTimeoutMs,
+                    operation:`translation_examples_fallback${suffix}`, uid,
+                    metrics:{ fromLang:context.fromLang, toLang:context.toLang }
+                });
+                fallbackCalls.push(response);
+                return Array.isArray(response.result?.examples) ? response.result.examples.slice(0, requestedCount) : [];
+            };
+            if (count === 10) {
+                // Ten-example responses are the most likely to be truncated. Repair
+                // them as two bounded five-example batches, while explicitly
+                // excluding the first batch from the second.
+                const first = await requestFallback(5, [], '_part_1');
+                const firstIssues = collectionIssues(first, 5);
+                if (firstIssues.length) {
+                    examples = first; issues = firstIssues;
+                } else {
+                    const second = await requestFallback(5, first.map(example => example.original), '_part_2');
+                    examples = [...first, ...second];
+                    issues = collectionIssues(examples, 10);
+                }
+            } else {
+                const repaired = await requestFallback(count);
+                examples = repaired;
+                issues = collectionIssues(examples, count);
+            }
         }
         if (issues.length) {
             const error = new Error(`Context examples were incomplete: ${issues.join(', ')}.`);
@@ -2766,8 +2817,8 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
         }
         return {
             context:{ ...contextItem, examples:examples.map(example => ({ ...example, distractors:[] })) },
-            modelCalls:[primary, fallback].filter(Boolean), fallbackUsed:!!fallback,
-            fallbackReason:fallback ? 'incomplete_or_truncated_examples' : ''
+            modelCalls:[primary, ...fallbackCalls].filter(Boolean), fallbackUsed:fallbackCalls.length > 0,
+            fallbackReason:fallbackCalls.length ? 'incomplete_or_truncated_examples' : ''
         };
     }
 
@@ -2839,102 +2890,20 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
 
     async function getCompleteDetails(context, uid, { forceRefresh = false } = {}) {
         const started = performance.now();
-        if (forceRefresh) invalidateContext(context);
-
-        const listResponse = await getPreview(context, uid);
-        const list = listResponse.preview;
-        const seedCore = composeCoreFromTranslationList(list, {}, [], context);
-        const accepted = seedCore?.sourceLanguageValidation?.existsInRequestedLanguage === true
-            && seedCore.wordExists === true;
-
-        const currentCoreEnvelope = l1Cache.get(dictionaryCacheKey('core', context));
-        const currentCore = currentCoreEnvelope?.result;
-        if (!forceRefresh
-            && Number(currentCoreEnvelope?.schemaVersion || 0) >= DICTIONARY_SCHEMA_VERSION
-            && currentCore
-            && contextsAreComplete(currentCore, context)
-            && coreQualityIssues(currentCore, context).length === 0) {
-            const cachedResponse = await getCore(context, uid);
-            return {
-                result:cachedResponse.result,
-                meta:{
-                    ...cachedResponse.meta,
-                    contextsReady:true,
-                    latencyMs:Math.round(performance.now() - started),
-                    modelCalls:cachedResponse.meta?.modelCalls || []
-                }
-            };
-        }
-
-        const corePromise = getCore(context, uid, { forceRefresh:false });
-        let batchPromise = Promise.resolve(null);
-        if (accepted && seedCore.contexts.length) {
-            const key = contextBatchFlightKey(context, seedCore);
-            batchPromise = singleFlight(exampleFlights, key, () => generateContextBatch(context, seedCore, uid));
-        }
-
-        const [coreResponse, batch] = await Promise.all([corePromise, batchPromise]);
-        let result = coreResponse.result;
-        if (!accepted || !result?.sourceLanguageValidation?.existsInRequestedLanguage || !result.wordExists) {
-            return {
-                result,
-                meta:{
-                    ...coreResponse.meta,
-                    contextsReady:true,
-                    latencyMs:Math.round(performance.now() - started)
-                }
-            };
-        }
-
-        if (!contextsAreComplete(result, context)) {
-            if (!batch) {
-                const key = contextBatchFlightKey(context, result);
-                const generated = await singleFlight(
-                    exampleFlights,
-                    key,
-                    () => generateContextBatch(context, result, uid)
-                );
-                result = normalizeTranslationResult({ ...result, contexts:generated.contexts }, context);
-                result = await saveCachedResult(context, result, {
-                    model:PRIMARY_MODEL,
-                    fallbackModel:generated.fallbackUsed ? FALLBACK_MODEL : '',
-                    fallbackUsed:generated.fallbackUsed,
-                    fallbackReason:generated.fallbackReason,
-                    preserveExamples:false,
-                    incrementUse:false
-                });
-                return {
-                    result,
-                    meta:{
-                        ...coreResponse.meta,
-                        contextsReady:true,
-                        fallbackUsed:coreResponse.meta?.fallbackUsed || generated.fallbackUsed,
-                        fallbackReason:[coreResponse.meta?.fallbackReason, generated.fallbackReason].filter(Boolean).join(','),
-                        latencyMs:Math.round(performance.now() - started),
-                        modelCalls:[...(coreResponse.meta?.modelCalls || []), ...generated.modelCalls]
-                    }
-                };
-            }
-            result = normalizeTranslationResult({ ...result, contexts:batch.contexts }, context);
-            result = await saveCachedResult(context, result, {
-                model:PRIMARY_MODEL,
-                fallbackModel:batch.fallbackUsed ? FALLBACK_MODEL : '',
-                fallbackUsed:batch.fallbackUsed,
-                fallbackReason:batch.fallbackReason,
-                preserveExamples:false,
-                incrementUse:false
-            });
-        }
-
+        // Details and context examples are deliberately separate reliability
+        // domains. A long or malformed example batch must never discard a valid
+        // translation, etymology, relation set or conjugation response. The client
+        // starts /contexts after this core response and can retry examples without
+        // regenerating (or charging again for) the dictionary details.
+        const coreResponse = await getCore(context, uid, { forceRefresh });
+        const result = coreResponse.result;
         return {
             result,
             meta:{
                 ...coreResponse.meta,
                 contextsReady:contextsAreComplete(result, context),
-                fallbackUsed:coreResponse.meta?.fallbackUsed || batch?.fallbackUsed || false,
-                fallbackReason:[coreResponse.meta?.fallbackReason, batch?.fallbackReason].filter(Boolean).join(','),
                 latencyMs:Math.round(performance.now() - started),
-                modelCalls:[...(coreResponse.meta?.modelCalls || []), ...(batch?.modelCalls || [])]
+                modelCalls:coreResponse.meta?.modelCalls || []
             }
         };
     }

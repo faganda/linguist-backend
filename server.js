@@ -18,7 +18,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '5.0.4';
+const BACKEND_VERSION = '5.0.5';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -806,8 +806,13 @@ app.get('/health', (_req, res) => res.json({
         readAloudVoiceControls:true, readAloudVoiceInstallHelp:true,
         normalizedAndroidVoiceLocales:true,
         focusedPracticeBanks:true, focusedPracticeFiveRounds:true,
+        listeningSpeechOrChoice:true,
+        focusedPronunciationForms:true,
+        focusedShadowingFeedback:true,
         completeTranslationFirst:true,
         onDemandTranslationDetails:true,
+        isolatedDetailAndContextGeneration:true,
+        splitTenExampleRepair:true,
         seamlessDetailReveal:true,
         meaningAlignedContextExamples:true,
         liveInterimTranscription:true,
@@ -830,6 +835,7 @@ app.get('/health', (_req, res) => res.json({
         qelumiPath:true,
         purposeCollections:true,
         dictionaryQualityWorkflow:true,
+        permanentDictionaryDeletion:true,
         publicVerifiedDictionary:true,
         privacySafeProductAnalytics:true,
         revenueCatEntitlements:true,
@@ -1708,15 +1714,30 @@ app.delete('/api/admin/dictionary/:id', requireUser, requireAdmin, async (req, r
     }
     const reference = dictionaryReference(req.params.id);
     try {
-        const {snapshot, versionId} = await snapshotDictionaryVersion(reference, 'archive', req.user.uid);
-        await reference.set({
-            previousQualityStatus:snapshot.data()?.qualityStatus || 'complete',
-            qualityStatus:'superseded', verificationStatus:snapshot.data()?.verificationStatus || 'ai_generated',
-            deletedAt:FieldValue.serverTimestamp(), deletedBy:req.user.uid,
-            qualityUpdatedAt:Date.now(), qualityUpdatedBy:req.user.uid
-        }, {merge:true});
+        const snapshot = await reference.get();
+        if (!snapshot.exists) return res.status(404).json({ error:{ message:'Dictionary entry not found.' } });
+        const entry = snapshot.data() || {};
+        // DELETE is intentionally distinct from the recoverable Archive action.
+        // Remove the shared entry and its version subcollection. User history lives
+        // under private user paths and is never touched by this operation.
+        await db.recursiveDelete(reference);
         translationService.invalidateDocumentId(req.params.id);
-        res.json({ ok:true, archived:true, previousVersionId:versionId });
+        try {
+            await db.collection('admin_metrics').doc('dictionary_audit').collection('items').add({
+                entryId:req.params.id,
+                action:'delete',
+                query:entry.originalQuery || '',
+                fromLang:entry.fromLang || '',
+                toLang:entry.toLang || '',
+                schemaVersion:Number(entry.schemaVersion || 0),
+                administratorUid:req.user.uid,
+                timestamp:Date.now(),
+                createdAt:FieldValue.serverTimestamp()
+            });
+        } catch (auditError) {
+            console.warn('Dictionary deletion succeeded but its administrator audit could not be written.', auditError.message);
+        }
+        res.json({ ok:true, deleted:true });
     } catch (error) { res.status(error.status || 500).json({error:{message:error.message}}); }
 });
 

@@ -175,6 +175,10 @@ const fiveItems = item => ({
     type:'array', minItems:5, maxItems:5, items:item
 });
 
+const oneToSixteenItems = item => ({
+    type:'array', minItems:1, maxItems:16, items:item
+});
+
 const sentencePracticeItem = Object.freeze({
     type:'object', additionalProperties:false,
     properties:{
@@ -222,8 +226,23 @@ const FOCUSED_PRACTICE_SCHEMA = Object.freeze({
             },
             required:['sourceSentence', 'targetSentence', 'clozeSentence', 'answer']
         }),
-        listeningChallenge:fiveItems(sentencePracticeItem),
-        pronunciationCoach:fiveItems(sentencePracticeItem),
+        listeningChallenge:fiveItems({
+            type:'object', additionalProperties:false,
+            properties:{
+                sourceSentence:{ type:'string' }, targetSentence:{ type:'string' },
+                acceptedAnswers:textArray(5),
+                choices:{ type:'array', minItems:4, maxItems:4, items:{ type:'string' } }
+            },
+            required:['sourceSentence', 'targetSentence', 'acceptedAnswers', 'choices']
+        }),
+        pronunciationCoach:oneToSixteenItems({
+            type:'object', additionalProperties:false,
+            properties:{
+                text:{ type:'string' }, translation:{ type:'string' },
+                partOfSpeech:{ type:'string' }, formLabel:{ type:'string' }
+            },
+            required:['text', 'translation', 'partOfSpeech', 'formLabel']
+        }),
         shadowingStudio:fiveItems(sentencePracticeItem)
     },
     required:[
@@ -356,18 +375,18 @@ export function buildLearningRequest(feature, input = {}) {
         if (!query || !translations.length || !meanings.length) {
             throw Object.assign(new Error('A complete translated entry is required for focused practice.'), { status:400 });
         }
-        const system = `You are Qelumi's focused-practice author. Create eight independent five-round exercises about the exact source entry "${query}". Every exercise array must contain exactly five usable items.
+        const system = `You are Qelumi's focused-practice author. Create eight independent exercises about the exact source entry "${query}". Sentence Builder, Translation Race, Context Detective, Word Families, Cloze Quiz, Listening Challenge and Shadowing Studio must each contain exactly five usable items. Pronunciation Coach is a word-and-form set and may contain 1 to 16 unique items.
 
-All sourceSentence values across all seven sentence-based exercise arrays must be different from one another, not merely punctuation variants. Use natural ${source.name} sentences and faithful ${target.name} translations. Every sentence must illustrate one of the supplied meanings accurately and contain the exact entry or a natural inflected form. Never borrow a sentence from an unrelated sense, topic or sport merely because it contains a similar word. Keep examples appropriate for general learners.
+All sourceSentence values across all seven sentence-based exercise arrays must be different from one another, not merely punctuation variants. Use natural ${source.name} sentences and faithful ${target.name} translations. Every sentence must illustrate one of the supplied meanings accurately and contain the exact entry, a supplied word-family member, or a genuine natural inflected form. Never borrow a sentence from an unrelated sense, topic or sport merely because it contains a similar word. Keep examples appropriate for general learners.
 
 Exercise contracts:
 - sentenceBuilder: five sentences suitable for rearranging word-by-word.
 - translationRace: five source sentences, faithful target sentences, and acceptedAnswers containing the full target sentence plus up to four genuinely equivalent answers.
 - contextDetective: five sentences, the exact supplied meaning label and definitions they illustrate, and 2-4 plausible meaning-label choices including the correct label.
 - wordFamilies: five genuine family words or morphologically related forms. If the supplied family is small, include responsible inflected or derived forms; never invent a word. choices contains 2-4 source-language words including the answer.
-- clozeQuiz: five sentences with clozeSentence equal to sourceSentence except that the exact/inflected occurrence is replaced once by ___. answer is the removed text.
-- listeningChallenge: five new sentences for source-language audio and target-language comprehension.
-- pronunciationCoach: five new, speakable source sentences of varied rhythm and length.
+- clozeQuiz: five sentences with clozeSentence equal to sourceSentence except that one permitted vocabulary form is replaced once by ___. The answer must be the exact entry, a supplied word-family member, or a genuine principal/inflected form. For an English verb, deliberately cover the gerund/present participle, past simple (preterite) and past participle when those forms exist; use the language's own pedagogically useful principal forms for other languages.
+- listeningChallenge: five new sentences for source-language audio and target-language comprehension. acceptedAnswers contains the targetSentence and up to four genuinely equivalent spoken answers. choices contains exactly four plausible ${target.name} sentences, including targetSentence exactly once; wrong choices must be realistic and close enough to require careful listening.
+- pronunciationCoach: return the exact entry first, followed by genuine supplied word-family members and useful principal forms. These items contain only the isolated source word or expression in text, never a full sentence. For an English verb include its gerund/present participle, past simple (preterite) and past participle when they exist. For another language choose its own useful principal forms rather than imposing English grammar. Remove duplicates and never invent a form merely to reach five items.
 - shadowingStudio: five new, natural source sentences suitable for shadowing.
 
 Do not reuse any source sentence between exercise types. Do not return commentary. Return strict JSON only.`;
@@ -436,12 +455,19 @@ const focusedPracticeGroups = Object.freeze([
 export function focusedPracticeQualityIssues(result) {
     const issues = [];
     if (!result || typeof result !== 'object') return ['empty focused-practice result'];
-    for (const group of focusedPracticeGroups) {
+    for (const group of focusedPracticeGroups.filter(group => group !== 'pronunciationCoach')) {
         if (!Array.isArray(result[group]) || result[group].length !== 5) {
             issues.push(`${group} must contain exactly five items`);
         }
     }
-    const sentenceGroups = focusedPracticeGroups.filter(group => group !== 'wordFamilies');
+    if (!Array.isArray(result.pronunciationCoach)
+        || result.pronunciationCoach.length < 1
+        || result.pronunciationCoach.length > 16) {
+        issues.push('pronunciationCoach must contain between one and sixteen items');
+    }
+    const sentenceGroups = focusedPracticeGroups.filter(group =>
+        group !== 'wordFamilies' && group !== 'pronunciationCoach'
+    );
     const seenSentences = new Map();
     for (const group of sentenceGroups) {
         for (const [index, item] of (result[group] || []).entries()) {
@@ -481,6 +507,28 @@ export function focusedPracticeQualityIssues(result) {
         if (!cleanText(item?.answer) || !String(item?.clozeSentence || '').includes('___')) {
             issues.push(`clozeQuiz item ${index + 1} has an invalid blank`);
         }
+    }
+    for (const [index, item] of (result.listeningChallenge || []).entries()) {
+        const target = cleanText(item?.targetSentence);
+        const choices = Array.isArray(item?.choices) ? item.choices.map(choice => cleanText(choice)).filter(Boolean) : [];
+        const accepted = Array.isArray(item?.acceptedAnswers) ? item.acceptedAnswers.map(answer => cleanText(answer)).filter(Boolean) : [];
+        if (choices.length !== 4
+            || new Set(choices.map(choice => choice.toLocaleLowerCase('en'))).size !== 4
+            || !choices.some(choice => choice.toLocaleLowerCase('en') === target.toLocaleLowerCase('en'))
+            || !accepted.some(answer => answer.toLocaleLowerCase('en') === target.toLocaleLowerCase('en'))) {
+            issues.push(`listeningChallenge item ${index + 1} has invalid answer choices`);
+        }
+    }
+    const pronunciationKeys = new Set();
+    for (const [index, item] of (result.pronunciationCoach || []).entries()) {
+        const text = cleanText(item?.text, 180);
+        const key = text.toLocaleLowerCase('en');
+        if (!text || !cleanText(item?.formLabel, 120)) {
+            issues.push(`pronunciationCoach item ${index + 1} is missing a word or form label`);
+        } else if (pronunciationKeys.has(key)) {
+            issues.push(`pronunciationCoach item ${index + 1} repeats an earlier pronunciation item`);
+        }
+        pronunciationKeys.add(key);
     }
     return [...new Set(issues)];
 }
