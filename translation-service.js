@@ -1564,7 +1564,9 @@ export function buildValidationRequest(context, primaryResult, issues = []) {
     };
 }
 
-export function buildExamplesRequest(context, coreResult, contextItem, count, { repairIssues = [], avoidExamples = [] } = {}) {
+export function buildExamplesRequest(context, coreResult, contextItem, count, {
+    repairIssues = [], avoidExamples = [], batchFocus = ''
+} = {}) {
     const fromName = LANGUAGES[cleanCode(context.fromLang)];
     const toName = LANGUAGES[cleanCode(context.toLang)];
     const meaning = coreResult.meanings?.[contextItem.meaningIndex] || {};
@@ -1577,9 +1579,11 @@ export function buildExamplesRequest(context, coreResult, contextItem, count, { 
         }));
     const system = `Generate exactly ${count} complete, natural, diverse examples for the one specified meaning of the exact Qelumi entry. Every example must illustrate this meaning and no alternate sense. Contrast the assigned definition against every excluded meaning supplied below before writing. Topic similarity is not enough: the event described by each sentence must logically instantiate the assigned sourceDefinition and targetDefinition. Never attach sport, food, computing or another domain merely because that domain appears in a different sense of the same spelling. Every source sentence must contain a natural inflected or exact form of the entry, and sourceSnippet must copy that exact form from original. Never end a sentence on an article, preposition, conjunction, ellipsis, dash, colon, or other unfinished fragment. Set complete=true only after checking both sentences are syntactically complete and semantically match the assigned meaning.
 
+${exactExpressionGuidance(context)}
+
 ${context.definitionsOnly ? `Write original and explanation in ${fromName}. Keep translated, targetTranslatedSnippet and blankedTranslation empty.` : `Write original in ${fromName}, translate it fully into ${toName}, and explain the usage in ${fromName}. targetTranslatedSnippet must be an exact substring of translated. blankedTranslation must equal the full translation with that exact substring replaced by ___.`}
 
-Every example must be materially different in situation and wording from the other examples in this response.${avoidExamples.length ? ` Do not repeat or closely paraphrase any of these already accepted source sentences: ${JSON.stringify(avoidExamples)}` : ''}
+Every example must be materially different in situation and wording from the other examples in this response.${avoidExamples.length ? ` Do not repeat or closely paraphrase any of these already accepted source sentences: ${JSON.stringify(avoidExamples)}` : ''}${batchFocus ? `\nDIVERSITY FOCUS FOR THIS REPAIR BATCH: ${batchFocus}` : ''}
 
 Do not create distractors. Return strict JSON matching the schema.${repairIssues.length ? ` Repair these prior defects: ${repairIssues.join('; ')}.` : ''}`;
     return {
@@ -2824,18 +2828,32 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
     }
 
     async function generateContextExamples(context, coreResult, contextItem, count, uid) {
-        let primary; let examples; let issues = [];
-        const collectionIssues = (items, expected, avoid = []) => {
-            const detected = [];
-            if (items.length !== expected) detected.push(`expected ${expected} examples, received ${items.length}`);
-            items.forEach((example, index) => detected.push(...exampleQualityIssues(example, context).map(issue => `example ${index + 1}: ${issue}`)));
-            const seen = new Set(avoid.map(item => normalizeDictionaryQuery(item)));
-            items.forEach((example, index) => {
-                const key = normalizeDictionaryQuery(example?.original);
-                if (key && seen.has(key)) detected.push(`example ${index + 1}: duplicate source sentence`);
-                if (key) seen.add(key);
+        let primary;
+        const accepted = [];
+        const detectedIssues = [];
+        const fallbackCalls = [];
+        const exampleKey = value => normalizeDictionaryQuery(value)
+            .replace(/[’‘`]/gu, "'")
+            .replace(/[‐‑‒–—]/gu, '-');
+        const acceptCandidates = (items, expected, batchLabel) => {
+            const candidates = Array.isArray(items) ? items : [];
+            if (candidates.length !== expected) {
+                detectedIssues.push(`${batchLabel}: expected ${expected} examples, received ${candidates.length}`);
+            }
+            const seen = new Set(accepted.map(example => exampleKey(example.original)));
+            candidates.forEach((example, index) => {
+                if (accepted.length >= count) return;
+                const issues = exampleQualityIssues(example, context);
+                const key = exampleKey(example?.original);
+                if (!key) issues.push('missing source sentence');
+                if (key && seen.has(key)) issues.push('duplicate source sentence');
+                if (issues.length) {
+                    detectedIssues.push(...issues.map(issue => `${batchLabel} example ${index + 1}: ${issue}`));
+                    return;
+                }
+                seen.add(key);
+                accepted.push(example);
             });
-            return detected;
         };
         try {
             primary = await modelJSON({
@@ -2844,49 +2862,68 @@ export function createTranslationService({ db, FieldValue, recordUsage = async (
                 operation:'translation_examples_primary', uid,
                 metrics:{ fromLang:context.fromLang, toLang:context.toLang }
             });
-            examples = Array.isArray(primary.result?.examples) ? primary.result.examples.slice(0, count) : [];
-            issues = collectionIssues(examples, count);
-        } catch (error) { issues = [error.code || error.message || 'example request failed']; }
+            acceptCandidates(primary.result?.examples, count, 'primary');
+        } catch (error) {
+            detectedIssues.push(`primary: ${error.code || error.message || 'example request failed'}`);
+        }
 
-        const fallbackCalls = [];
-        if (issues.length) {
-            const requestFallback = async (requestedCount, avoidExamples = [], suffix = '') => {
+        const requestFallback = async (requestedCount, suffix, batchFocus) => {
+            if (requestedCount < 1) return null;
+            const avoidExamples = accepted.map(example => example.original);
+            try {
                 const response = await modelJSON({
                     model:FALLBACK_MODEL, thinkingLevel:FALLBACK_THINKING,
-                    body:buildExamplesRequest(context, coreResult, contextItem, requestedCount, { repairIssues:issues, avoidExamples }), timeoutMs:fallbackTimeoutMs,
+                    body:buildExamplesRequest(context, coreResult, contextItem, requestedCount, {
+                        repairIssues:detectedIssues.slice(-24), avoidExamples, batchFocus
+                    }), timeoutMs:fallbackTimeoutMs,
                     operation:`translation_examples_fallback${suffix}`, uid,
                     metrics:{ fromLang:context.fromLang, toLang:context.toLang }
                 });
                 fallbackCalls.push(response);
-                return Array.isArray(response.result?.examples) ? response.result.examples.slice(0, requestedCount) : [];
-            };
-            if (count === 10) {
-                // Ten-example responses are the most likely to be truncated. Repair
-                // them as two bounded five-example batches, while explicitly
-                // excluding the first batch from the second.
-                const first = await requestFallback(5, [], '_part_1');
-                const firstIssues = collectionIssues(first, 5);
-                if (firstIssues.length) {
-                    examples = first; issues = firstIssues;
-                } else {
-                    const second = await requestFallback(5, first.map(example => example.original), '_part_2');
-                    examples = [...first, ...second];
-                    issues = collectionIssues(examples, 10);
-                }
-            } else {
-                const repaired = await requestFallback(count);
-                examples = repaired;
-                issues = collectionIssues(examples, count);
+                return {response, requestedCount, suffix};
+            } catch (error) {
+                detectedIssues.push(`fallback ${suffix}: ${error.code || error.message || 'example request failed'}`);
+                return null;
             }
+        };
+
+        let missing = count - accepted.length;
+        if (missing > 5) {
+            // If a ten-example response fails, two compact repair batches run in
+            // parallel. This remains within the client's request deadline and the
+            // different situation briefs reduce duplicate sentences.
+            const firstCount = Math.min(5, missing);
+            const secondCount = Math.min(5, Math.max(0, missing - firstCount));
+            const repairs = await Promise.all([
+                requestFallback(firstCount, '_part_1', 'Use everyday personal, work, travel, learning and service situations.'),
+                requestFallback(secondCount, '_part_2', 'Use dialogue, reported speech, planning, news and problem-solving situations.')
+            ]);
+            repairs.filter(Boolean).forEach((repair, index) => {
+                acceptCandidates(repair.response.result?.examples, repair.requestedCount, `fallback batch ${index + 1}`);
+            });
+        } else if (missing > 0) {
+            const repair = await requestFallback(missing, '_repair', 'Use situations not represented by the already accepted examples.');
+            if (repair) acceptCandidates(repair.response.result?.examples, repair.requestedCount, 'fallback repair');
         }
-        if (issues.length) {
-            const error = new Error(`Context examples were incomplete: ${issues.join(', ')}.`);
+
+        missing = count - accepted.length;
+        if (missing > 0) {
+            const finalRepair = await requestFallback(
+                Math.min(5, missing), '_final',
+                'Supply only the still-missing examples. Make every situation and sentence distinct from the exclusion list.'
+            );
+            if (finalRepair) acceptCandidates(finalRepair.response.result?.examples, finalRepair.requestedCount, 'final repair');
+        }
+
+        if (accepted.length !== count) {
+            const conciseIssues = detectedIssues.slice(-30);
+            const error = new Error(`Context examples were incomplete: accepted ${accepted.length} of ${count}. ${conciseIssues.join(', ')}.`);
             error.status = 502; error.code = 'EXAMPLES_INCOMPLETE'; throw error;
         }
         return {
-            context:{ ...contextItem, examples:examples.map(example => ({ ...example, distractors:[] })) },
+            context:{ ...contextItem, examples:accepted.map(example => ({ ...example, distractors:[] })) },
             modelCalls:[primary, ...fallbackCalls].filter(Boolean), fallbackUsed:fallbackCalls.length > 0,
-            fallbackReason:fallbackCalls.length ? 'incomplete_or_truncated_examples' : ''
+            fallbackReason:fallbackCalls.length ? 'partial_or_invalid_examples_repaired' : ''
         };
     }
 

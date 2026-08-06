@@ -19,7 +19,7 @@ import { planHistoryDeletion } from './history-service.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '5.0.6';
+const BACKEND_VERSION = '5.0.7';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -807,7 +807,8 @@ app.get('/health', (_req, res) => res.json({
         readAloudVoiceControls:true, readAloudVoiceInstallHelp:true,
         normalizedAndroidVoiceLocales:true,
         focusedPracticeBanks:true, focusedPracticeFiveRounds:true,
-        listeningSpeechOrChoice:true,
+        listeningSpeechOrChoice:true, listeningAnswerModePerQuestion:true,
+        partialContextExampleRepair:true, immediateHistoryRefreshPatches:true,
         focusedPronunciationForms:true,
         focusedShadowingFeedback:true,
         focusedTypedEnterSubmission:true,
@@ -1046,7 +1047,14 @@ app.delete('/api/history/:id', requireUser, requireRegisteredUser,
                 deletedHistory:1,
                 deletedExamples:plan.deletedExampleIds.length,
                 renumberedHistory:plan.historyNumberUpdates.length,
-                renumberedExamples:plan.savedExampleNumberUpdates.length
+                renumberedExamples:plan.savedExampleNumberUpdates.length,
+                // Return the committed patch so every open client can update its
+                // History and Review views immediately while Firestore listeners
+                // reconcile their persistent cache in the background.
+                deletedHistoryId:historyId,
+                deletedExampleIds:plan.deletedExampleIds,
+                historyNumberUpdates:plan.historyNumberUpdates,
+                savedExampleNumberUpdates:plan.savedExampleNumberUpdates
             });
         } catch (error) {
             res.status(error.status || 500).json({error:{code:error.code || 'HISTORY_DELETE_FAILED', message:error.message || 'The history item could not be deleted.'}});
