@@ -16,10 +16,14 @@ import {
     buildLearningRequest, focusedPracticeQualityIssues, summarizePerformanceEvents
 } from './learning-service.js';
 import { planHistoryDeletion } from './history-service.js';
+import {
+    buildFirestoreResourceDiagnostic, createFirestoreDiagnosticReference,
+    isFirestoreResourceExhausted, sanitizeFirestoreDiagnosticText
+} from './firestore-diagnostics.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '5.0.8';
+const BACKEND_VERSION = '5.0.9';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -822,6 +826,7 @@ app.get('/health', (_req, res) => res.json({
         deterministicDetailFallback:true,
         splitTenExampleRepair:true,
         seamlessDetailReveal:true,
+        seamlessContextExampleReveal:true,
         meaningAlignedContextExamples:true,
         liveInterimTranscription:true,
         deduplicatedLiveTranscription:true,
@@ -842,6 +847,8 @@ app.get('/health', (_req, res) => res.json({
         automaticHistoryPagination:true,
         associatedExampleDeletion:true,
         quotaEfficientHistoryNumbering:true,
+        safeFirestoreQuotaDiagnostics:true,
+        diagnosticReferences:true,
         historyReviewCrossNavigation:true,
         directAssociatedExampleNavigation:true,
         translationHistoryBadges:true,
@@ -1019,17 +1026,23 @@ app.delete('/api/account', requireUser,
 app.delete('/api/history/:id', requireUser, requireRegisteredUser,
     rateLimit({ windowMs:60 * 60_000, max:30, key:req => `history-delete:${req.user.uid}` }),
     async (req, res) => {
+        let firestoreStage = 'request_validation';
+        let attemptedOperations = {documentReads:0, documentWrites:0, documentDeletes:0};
+        let deleteExamples = false;
+        let historyId = '';
         try {
-            const historyId = String(req.params.id || '');
+            historyId = String(req.params.id || '');
             if (!/^[A-Za-z0-9_-]{1,128}$/.test(historyId)) {
                 return res.status(400).json({error:{code:'INVALID_HISTORY_ID', message:'That history item is invalid.'}});
             }
-            const deleteExamples = req.body?.deleteExamples === true;
+            deleteExamples = req.body?.deleteExamples === true;
             const userReference = db.collection('artifacts').doc(APP_ID).collection('users').doc(req.user.uid);
             const historyCollection = userReference.collection('history');
             const savedCollection = userReference.collection('saved_examples');
             const historyReference = historyCollection.doc(historyId);
             const numberingReference = userReference.collection('metadata').doc('history_numbering');
+            firestoreStage = 'history_document_read';
+            attemptedOperations = {documentReads:1, documentWrites:0, documentDeletes:0};
             const historyDocument = await historyReference.get();
             if (!historyDocument.exists) {
                 return res.status(404).json({error:{code:'HISTORY_NOT_FOUND', message:'That history item no longer exists.'}});
@@ -1046,6 +1059,8 @@ app.delete('/api/history/:id', requireUser, requireRegisteredUser,
                     // gate verify the word and language pair.
                     candidateQueries.push(savedCollection.where('wordNumber', '==', rawWordNumber).get());
                 }
+                firestoreStage = 'associated_examples_read';
+                attemptedOperations = {documentReads:1, documentWrites:0, documentDeletes:0};
                 const [numberingDocument, ...candidateSnapshots] = await Promise.all([
                     numberingReference.get(), ...candidateQueries
                 ]);
@@ -1077,6 +1092,12 @@ app.delete('/api/history/:id', requireUser, requireRegisteredUser,
                     updatedAt:FieldValue.serverTimestamp()
                 }, {merge:true});
             }
+            firestoreStage = 'history_delete_commit';
+            attemptedOperations = {
+                documentReads:0,
+                documentWrites:deleteExamples && plan.compactedWordNumber ? 1 : 0,
+                documentDeletes:1 + plan.deletedExampleIds.length
+            };
             await batch.commit();
             res.json({
                 ok:true,
@@ -1094,13 +1115,44 @@ app.delete('/api/history/:id', requireUser, requireRegisteredUser,
                 ...(deleteExamples ? {numberingCompactions:plan.compactedWordNumbers} : {})
             });
         } catch (error) {
-            const quotaExceeded = error.code === 8 || error.code === 'resource-exhausted'
-                || error.code === 'RESOURCE_EXHAUSTED';
-            res.status(quotaExceeded ? 429 : error.status || 500).json({error:{
-                code:quotaExceeded ? 'FIRESTORE_QUOTA_TEMPORARILY_EXHAUSTED' : error.code || 'HISTORY_DELETE_FAILED',
-                message:quotaExceeded
-                    ? 'Firestore is temporarily refusing writes because the project quota was already exhausted. Please retry after the quota window resets; future deletions use the low-write path.'
-                    : error.message || 'The history item could not be deleted.'
+            if (isFirestoreResourceExhausted(error)) {
+                const diagnostic = buildFirestoreResourceDiagnostic(error, {
+                    operation:'history_delete',
+                    stage:firestoreStage,
+                    ...attemptedOperations,
+                    deleteExamples,
+                    userHash:stableHash(req.user.uid).slice(0, 12),
+                    resourceHash:stableHash(historyId).slice(0, 12)
+                });
+                // This single structured line is searchable by diagnosticReference
+                // in Render. It contains the provider's quota metric when supplied,
+                // or the exact Firestore operation stage when Google omits it. User
+                // identifiers, document paths, project ids, emails and credentials
+                // are never included in clear text.
+                console.error('[QELUMI_FIRESTORE_RESOURCE_EXHAUSTED]', JSON.stringify(diagnostic.log));
+                res.set('Cache-Control', 'no-store');
+                return res.status(429).json({error:{
+                    code:'FIRESTORE_RESOURCE_EXHAUSTED',
+                    message:`Firestore temporarily refused this History deletion because a quota or capacity limit was exhausted. Diagnostic reference: ${diagnostic.diagnosticReference}.`,
+                    diagnosticReference:diagnostic.diagnosticReference,
+                    retryable:true
+                }});
+            }
+            const diagnosticReference = createFirestoreDiagnosticReference();
+            console.error('[QELUMI_HISTORY_DELETE_FAILED]', JSON.stringify({
+                diagnosticReference,
+                operation:'history_delete',
+                stage:firestoreStage,
+                code:String(error?.code || 'HISTORY_DELETE_FAILED').slice(0, 80),
+                message:sanitizeFirestoreDiagnosticText(error?.message || 'History deletion failed.'),
+                userHash:stableHash(req.user.uid).slice(0, 12),
+                resourceHash:stableHash(historyId).slice(0, 12)
+            }));
+            res.set('Cache-Control', 'no-store');
+            return res.status(error.status || 500).json({error:{
+                code:'HISTORY_DELETE_FAILED',
+                message:`The history item could not be deleted. Diagnostic reference: ${diagnosticReference}.`,
+                diagnosticReference
             }});
         }
     });
