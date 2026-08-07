@@ -23,7 +23,7 @@ import {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BACKEND_VERSION = '5.0.9';
+const BACKEND_VERSION = '5.1.0';
 const APP_ID = process.env.APP_ID || 'linguist-app-v7';
 const ADMIN_UID = process.env.ADMIN_UID || 'rJvQjMmE6qMKmazel2NyvgGcVHw2';
 const FEEDBACK_EMAIL_TO = process.env.FEEDBACK_EMAIL_TO || 'feedback@qelumi.com';
@@ -849,6 +849,13 @@ app.get('/health', (_req, res) => res.json({
         quotaEfficientHistoryNumbering:true,
         safeFirestoreQuotaDiagnostics:true,
         diagnosticReferences:true,
+        duplicateSafeContextExampleSaving:true,
+        deterministicSavedExampleIds:true,
+        enrichedTranslationSharing:true,
+        translationDeepLinks:true,
+        automaticShadowingSilenceStop:true,
+        pausableExerciseAudio:true,
+        webAndNativeAppleSignIn:true,
         historyReviewCrossNavigation:true,
         directAssociatedExampleNavigation:true,
         translationHistoryBadges:true,
